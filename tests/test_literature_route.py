@@ -342,9 +342,10 @@ def test_corpus_activity_logs_all_terms_without_the_question(tmp_path):
     line = next(p["token"] for p in conn.pushed if p.get("type") == "chat_thinking")
     assert all(term in line for term in terms)
     assert question not in line and "This question" not in line and "queries" not in line
-    logged = json.loads(line[line.index("(") + 1:line.rindex(")")])
-    assert logged == {"terms": terms, "top_k": lit.CORPUS_PASSAGES,
-                      "max_per_paper": lit.CORPUS_MAX_PER_PAPER}
+    # In words, never the call's JSON (RCHENLAB/AiScientist#121), with the budget it ran with.
+    assert line == (f"→ {lit.CORPUS_TOOL} — terms {', '.join(terms)} · top k {lit.CORPUS_PASSAGES} · "
+                    f"max per paper {lit.CORPUS_MAX_PER_PAPER}\n")
+    assert "{" not in line
     assert calls == [{"queries": [question.strip()], "terms": terms, "top_k": lit.CORPUS_PASSAGES,
                       "max_per_paper": lit.CORPUS_MAX_PER_PAPER}]
 

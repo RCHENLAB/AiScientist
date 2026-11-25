@@ -149,7 +149,7 @@ def test_a_record_keeps_what_the_team_needs_and_scrubs_what_it_must_not():
     assert rec["pipelines"] == ["gene_signature_scoring"]
     assert rec["outcome"] == {"converged": True, "accepted_steps": 3, "untested_accepted": 1,
                               "tested_accepted": 1, "code_attempts": 2, "code_failures": 1,
-                              "claims_checked": 2}
+                              "claims_checked": 2, "not_available": 0}
     score = [s for s in rec["steps"] if s["step"] == SCORE][0]
     assert "sc.read_h5ad('sample.h5ad')" in score["code_calls"][1]["code"]
     assert score["critique"] == "ok" and rec["induced_skills"] == ["score_phototransduction"]

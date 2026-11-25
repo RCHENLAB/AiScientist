@@ -1,122 +1,91 @@
-# Kubernetes manifests for running AiScientist IN A POD: an example for another cluster.
-# The lab server does not use this file. There the app is a host systemd unit and the cluster only
-# routes to it: see host-backend.yaml and deploy/README.md. Replace every <placeholder>.
+# AiScientist in a pod: the service image of one release, its data volume and its Service.
+# The guide is deploy/k8s/README.md. The lab server does not use this file: there the app is a host
+# systemd unit, and the cluster only routes to it (host-backend.yaml).
 #
-# ▲▲▲ CRITICAL — this app is a STATEFUL SINGLETON ▲▲▲
-#   It holds a per-session SSH tunnel to HPC3 + in-memory connection state in ONE process.
-#   - replicas MUST be 1 (a 2nd pod can't see the 1st pod's tunnels → broken sessions).
-#   - strategy MUST be Recreate (never run two pods at once), NOT RollingUpdate.
-#   - the pod needs EGRESS to hpc3.rcic.uci.edu:22 (SSH) + DNS — open it in any NetworkPolicy.
-#   - run artifacts need a PersistentVolume; accounts need PostgreSQL (managed or in-cluster).
-#   A restart drops live sessions (users reconnect) — inherent to the SSH-tunnel design.
----
-apiVersion: v1
-kind: Secret
-metadata:
-  name: bioagent-secrets
-  namespace: <namespace>
-type: Opaque
-stringData:
-  # Signs session cookies — MUST be strong & unique (NOT a default). Generate with:
-  #   python -c "import secrets; print(secrets.token_urlsafe(48))"
-  # As an environment variable it makes the app warn at every start: mount this key as a file and
-  # set AISCIENTIST_SECRET_KEY_FILE to its path instead (configs/aiscientist.example.env, section 13).
-  AISCIENTIST_SECRET_KEY: "<strong-random-secret>"
-  AISCIENTIST_PUBLIC_HTTPS: "1"                 # marks session cookies Secure (HTTPS-only)
-  # PostgreSQL is REQUIRED (NOT SQLite) — UCI-wide / multi-project use needs real concurrency.
-  # Point this at a dedicated PG (in-cluster StatefulSet with its own PVC, or managed):
-  AISCIENTIST_DATABASE_URL: "postgresql+psycopg://bioagent:<db-password>@<pg-service>:5432/bioagent"
-  # First admin — seed from a BCRYPT HASH, never a plaintext/default password:
-  #   aiscientist-admin hash       # prompts, prints a bcrypt hash to paste here
-  AISCIENTIST_ADMIN_USER: "<admin-username>"
-  AISCIENTIST_ADMIN_PASSWORD_HASH: "<bcrypt-hash>"
-  # HPC3 / vLLM connection settings as already configured (host, account, image, etc.)
+# Before applying, create the Secret aiscientist-secrets and the ConfigMap aiscientist-config, and
+# set the image to the digest the release notes name (README):
+#
+#   sed "s#ghcr.io/rchenlab/aiscientist@sha256:<digest>#$IMAGE#" deploy/k8s/aiscientist.yaml \
+#     | kubectl -n aiscientist apply -f -
+#
+# The gateway holds each session's SSH connection to HPC3 in memory, in one process:
+#   - one replica and strategy Recreate: never two pods at once;
+#   - replacing the pod ends the live sessions: users stay signed in and connect to HPC3 again;
+#   - the pod needs egress to DNS and to HPC3's SSH port (22).
 ---
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
-  name: bioagent-runs
-  namespace: <namespace>
+  name: aiscientist-data
+  labels: { app.kubernetes.io/name: aiscientist }
 spec:
-  accessModes: ["ReadWriteOnce"]            # single replica → RWO is fine
-  storageClassName: <storage-class>
+  accessModes: ["ReadWriteOnce"]           # one pod
+  # storageClassName: <class>              # unset: the cluster's default class
   resources:
     requests:
-      storage: 50Gi
+      storage: 50Gi                        # datasets, uploads and run outputs; the saved keys
 ---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: aiscientist
-  namespace: <namespace>
+  labels: { app.kubernetes.io/name: aiscientist }
 spec:
-  replicas: 1                               # ← keep 1 (stateful singleton; do not scale)
+  replicas: 1                              # a second pod could not see the first one's sessions
   strategy:
-    type: Recreate                          # ← never two pods at once
+    type: Recreate                         # stop the old pod before the new one starts
   selector:
-    matchLabels: { app: aiscientist }
+    matchLabels: { app.kubernetes.io/name: aiscientist }
   template:
     metadata:
-      labels: { app: aiscientist }
+      labels: { app.kubernetes.io/name: aiscientist }
     spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001                   # the image's account
+        runAsGroup: 10001
+        fsGroup: 10001                     # makes the volume writable by the app
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile: { type: RuntimeDefault }
       containers:
         - name: app
-          image: <registry>/aiscientist:<tag>
-          ports: [{ containerPort: 8800 }]
+          image: ghcr.io/rchenlab/aiscientist@sha256:<digest>
+          ports:
+            - { name: http, containerPort: 8800 }
           envFrom:
-            - secretRef: { name: bioagent-secrets }
+            - configMapRef: { name: aiscientist-config, optional: true }
+            - secretRef: { name: aiscientist-secrets }
           volumeMounts:
-            - { name: runs, mountPath: /data/runs }
+            - { name: data, mountPath: /data/aiscientist }
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: { drop: ["ALL"] }
+          startupProbe:                    # a first start migrates the database
+            httpGet: { path: /health, port: http }
+            periodSeconds: 5
+            failureThreshold: 60
           readinessProbe:
-            httpGet: { path: /, port: 8800 }
-            initialDelaySeconds: 10
+            httpGet: { path: /health, port: http }
             periodSeconds: 10
+            timeoutSeconds: 5
           livenessProbe:
-            httpGet: { path: /, port: 8800 }
-            initialDelaySeconds: 30
+            httpGet: { path: /health, port: http }
             periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 4
           resources:
             requests: { cpu: "1", memory: 2Gi }
-            limits:   { cpu: "4", memory: 8Gi }   # scanpy runs in-pod; give it room
+            limits: { memory: 8Gi }
       volumes:
-        - name: runs
-          persistentVolumeClaim: { claimName: bioagent-runs }
+        - name: data
+          persistentVolumeClaim: { claimName: aiscientist-data }
 ---
 apiVersion: v1
 kind: Service
 metadata:
   name: aiscientist
-  namespace: <namespace>
+  labels: { app.kubernetes.io/name: aiscientist }
 spec:
-  selector: { app: aiscientist }
+  selector: { app.kubernetes.io/name: aiscientist }
   ports:
-    - { name: http, port: 80, targetPort: 8800 }
----
-apiVersion: networking.k8s.io/v1
-kind: Ingress
-metadata:
-  name: aiscientist
-  namespace: <namespace>
-  annotations:
-    # Translated from the standalone nginx conf — needed because runs stream for minutes,
-    # the first connect waits ~10 min for vLLM to load, datasets are large, and the UI uses
-    # WebSockets (nginx-ingress upgrades WS automatically; these tune the rest).
-    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
-    nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
-    nginx.ingress.kubernetes.io/proxy-body-size: "8g"
-    nginx.ingress.kubernetes.io/proxy-buffering: "off"
-spec:
-  ingressClassName: nginx                   # ← match your cluster's ingress class
-  tls:
-    - hosts: [<PUBLIC_HOSTNAME>]
-      secretName: <tls-secret>              # ← per-host cert Secret, or your cluster wildcard
-  rules:
-    - host: <PUBLIC_HOSTNAME>
-      http:
-        paths:
-          - path: /
-            pathType: Prefix
-            backend:
-              service:
-                name: aiscientist
-                port: { number: 80 }
+    - { name: http, port: 80, targetPort: http }

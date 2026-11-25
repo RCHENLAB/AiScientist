@@ -22,7 +22,7 @@ Browser ──HTTPS :443──▶ Envoy Gateway on the lab server's Kubernetes c
   to HPC3 in memory, so there is exactly one instance and no load balancing. A restart ends the
   live sessions: users stay signed in (the sign-in cookie is signed, not stored) but connect to
   HPC3 again, and a run that was interrupted can be continued.
-- **The cluster only routes.** There is no pod and no image. The objects are in
+- **The cluster only routes.** There is no pod. The objects are in
   [`k8s/host-backend.yaml`](k8s/host-backend.yaml).
 - **The unit binds the node's internal IP**, the address the Endpoints object names. Loopback
   cannot be reached from the cluster, and the public address must not carry port 8800.
@@ -41,7 +41,7 @@ folder, with its own virtual environment, and `app/current` names the one that r
 | `/data/aiscientist/app/held` | tags the deploy timer never installs: one rolled back from, or one whose health check failed |
 | `/data/aiscientist/config/` | mode 0700: `.env`, the app's settings and secrets ([Configuration](#configuration)); `deploy.env`, the deploy's own settings; the encrypted backups of the credential stores |
 | `/data/aiscientist/data/` | `AISCIENTIST_DATA_ROOT`, the users' data ([`docs/dataset_storage.md`](../docs/dataset_storage.md)): `users/<account>/datasets/<uuid>/`, uploads in progress under `temp/<account>/` (an unfinished browser upload is removed 24 hours after its last write, `AISCIENTIST_UPLOAD_TTL_SECONDS`), each run's outputs under `analysis_results/<UCInetID>/<run_id>/` (`AISCIENTIST_RESULTS_DIR`), `corpus_scans/`, `exports/`, `reference/genesets/` (preserved gene-set reference libraries, not copied into app releases), and `reference/retigene/`: the copy of the RetiGene index that literature searches read, written by `scripts/update_corpus_index.py` (see the `search_corpus` tool's documentation) |
-| `/data/aiscientist/state/` | `AISCIENTIST_STATE_DIR`, mode 0700: the session secret (`session_secret`), the users' saved SSH keys (`ssh_creds/`) and LLM API keys (`llm_creds/`) with the master key that encrypts them (`llm_key.master`), the model list once an admin has saved it, `induced_skills/` (`AISCIENTIST_INDUCED_SKILLS_DIR`: skills learned from runs, with their review file), and `skill_requests/` (one 0600 JSON file per run that needed code the AI wrote, read in Admin → Skill requests) |
+| `/data/aiscientist/state/` | `AISCIENTIST_STATE_DIR`, mode 0700: the session secret (`session_secret`), the users' saved SSH keys (`ssh_creds/`) and LLM API keys (`llm_creds/`) with the master key that encrypts them (`llm_key.master`), the model list once an admin has saved it, `induced_skills/` (`AISCIENTIST_INDUCED_SKILLS_DIR`: skills learned from runs, with their review file), and `skill_requests/` (one 0600 JSON file per run that needed code the AI wrote or had a plan step no tested tool or skill does, read in Admin → Skill requests) |
 | `/data/aiscientist/skills/releases/<version>/` | the curated skills: releases of aiscientist-skills, installed and checked by [`deploy_skills.sh`](deploy_skills.sh), read-only. `skills/current` names the one the app reads; without it, the tag `configs/skills_registry.json` pins (found through `AISCIENTIST_SKILLS_REGISTRY_RELEASES_ROOT`). An app release never ships or deletes them. Without one there are no curated skills |
 | `/data/aiscientist/logs/` | `deploy.log`: one line per install, switch, rollback, refusal and prune. The units write to the journal |
 | `/data/aiscientist/backups/` | `env/` (mode 0700): copies of `config/.env` taken before an edit; `release-layout-<stamp>/`: the code and venv of the rsync layout, which `migrate_release_layout.sh --rollback` puts back ([below](#moving-a-server-to-releases)); copies taken before a migration; `_archive_<date>/`: items set aside for 30 days before deletion, each with a `MANIFEST.txt` |
@@ -77,7 +77,9 @@ are built from one commit. Versions are ordered as Python orders them:
    commit's runtime files with [`build_package.sh`](build_package.sh) (no tests, docs or
    experiments) and attaches `aiscientist-<tag>.tar.gz` and `SHA256SUMS` to the tag's GitHub
    Release, which it marks as a pre-release for a pre-release tag. The package's `VERSION` names the
-   tag and the commit.
+   tag and the commit. A second job builds the service image from that package, smoke-tests it,
+   publishes it at `ghcr.io/rchenlab/aiscientist:<tag>` and names its digest in the release notes
+   ([`k8s/README.md`](k8s/README.md)). The server does not use the image, and does not wait for it.
 2. **The install.** GitHub cannot reach the server inside the university network, but the server
    can reach GitHub. Every 10 minutes `aiscientist-deploy.timer` runs
    [`deploy_release.sh --auto`](deploy_release.sh) as the service account. When the latest release
@@ -418,9 +420,10 @@ releases.
 8. Releases: `migrate_release_layout.sh --tag <tag> --apply --timer`
    ([Moving a server to releases](#moving-a-server-to-releases)).
 
-[`Dockerfile`](Dockerfile), [`k8s/aiscientist.yaml`](k8s/aiscientist.yaml) and
-[`nginx/`](nginx/aiscientist.example.conf) describe two other shapes, the app in a pod and the app
-behind nginx on a bare host. The lab server uses neither, and no test exercises them.
+Two other shapes run the same release. One is the app in a pod, from the service image each
+release publishes: [`k8s/README.md`](k8s/README.md). The other is the app behind nginx on a bare
+host: [`nginx/`](nginx/aiscientist.example.conf). The lab server uses neither. The release workflow
+smoke-tests the image; no test exercises the nginx configuration.
 
 ## Check before opening a server to the internet
 

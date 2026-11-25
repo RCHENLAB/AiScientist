@@ -39,40 +39,54 @@ def test_singular_step_count():
     assert not out[0]["text"].startswith("📋 Plan ready — 1 steps")
 
 
-def test_dag_plan_event_surfaces_task_count():
+# How the scheduler works is for whoever opens the activity log; the progress list has no line about
+# the dependency plan, the Coordinator, claiming a task or parallel batches (RCHENLAB/AiScientist#121).
+
+def test_dag_plan_event_goes_to_the_activity_log_only():
     out = _lab_event_to_chat({"type": "lab_plan_dag", "nodes": [
         {"id": "s1", "goal": "QC"},
         {"id": "s2", "goal": "Cluster", "depends_on": ["s1"]},
         {"id": "s3", "goal": "Lit", "depends_on": ["s1"]},
     ]})
-    assert len(out) == 1 and out[0]["type"] == "lab_progress"
-    assert "3 task" in out[0]["text"] and "2 with prerequisites" in out[0]["text"]
+    assert _kinds(out) == ["chat_thinking"]
+    assert "3 task" in out[0]["token"] and "2 with prerequisites" in out[0]["token"]
 
 
-def test_coordinator_pick_surfaces_choice():
+def test_coordinator_pick_goes_to_the_activity_log_only():
     out = _lab_event_to_chat({"type": "coordinator_pick", "next": "s3", "ready": ["s2", "s3"]})
-    types = [p["type"] for p in out]
-    assert "chat_thinking" in types and "lab_progress" in types   # activity log + a feed line
-    assert any("s3" in p.get("token", "") for p in out)
+    assert _kinds(out) == ["chat_thinking"]
+    assert "s3" in out[0]["token"] and "Coordinator" in out[0]["token"]
 
 
-def test_node_claim_surfaces_the_expert():
+def test_node_claim_goes_to_the_activity_log_only():
     out = _lab_event_to_chat({"type": "node_claim", "node": "s3", "specialist": "Pathway & enrichment specialist"})
-    assert len(out) == 1 and out[0]["type"] == "lab_progress"
-    assert "Pathway & enrichment specialist" in out[0]["text"] and "claimed" in out[0]["text"]
+    assert _kinds(out) == ["chat_thinking"]
+    assert "Pathway & enrichment specialist" in out[0]["token"] and "claimed" in out[0]["token"]
 
 
-def test_concurrency_batch_surfaces_parallel_count():
+def test_concurrency_batch_goes_to_the_activity_log_only():
     out = _lab_event_to_chat({"type": "concurrency_batch", "nodes": ["s4", "s5"]})
-    assert len(out) == 1 and out[0]["type"] == "lab_progress"
-    assert "2 independent tasks in parallel" in out[0]["text"]
+    assert _kinds(out) == ["chat_thinking"]
+    assert "2 independent tasks in parallel" in out[0]["token"]
 
 
-def test_memory_events_surface():
+def test_memory_events_go_to_the_activity_log():
     r = _lab_event_to_chat({"type": "memory_read", "specialist": "QC specialist"})
     assert r and r[0]["type"] == "chat_thinking" and "recalled" in r[0]["token"]
     f = _lab_event_to_chat({"type": "memory_reflect", "specialist": "QC specialist"})
-    assert f and f[0]["type"] == "lab_progress" and "updated its lessons" in f[0]["text"]
+    assert _kinds(f) == ["chat_thinking"] and "updated its lessons" in f[0]["token"]
+
+
+def test_no_scheduler_line_reaches_the_progress_list():
+    events = [
+        {"type": "lab_plan_dag", "nodes": [{"id": "s1", "goal": "QC"}, {"id": "s2", "goal": "DE", "depends_on": ["s1"]}]},
+        {"type": "coordinator_pick", "next": "s2", "ready": ["s2"]},
+        {"type": "node_claim", "node": "s2", "specialist": "Geneticist"},
+        {"type": "concurrency_batch", "nodes": ["s2", "s3"]},
+        {"type": "memory_reflect", "specialist": "Geneticist"},
+    ]
+    lines = [p["text"] for ev in events for p in _lab_event_to_chat(ev) if p["type"] == "lab_progress"]
+    assert lines == []
 
 
 def test_scientist_start_is_key_progress():
@@ -88,10 +102,36 @@ def test_tool_start_activity_plus_live_status():
     # but ALSO drives the transient live status so "running a tool" isn't a silent window.
     out = _lab_event_to_chat(
         {"type": "tool_start", "tool": "scanpy_qc", "args": {"min_genes": 200}})
-    assert _kinds(out) == ["chat_thinking", "run_status"]
+    assert _kinds(out) == ["chat_thinking", "run_status", "run_command"]
     assert out[0]["token"].endswith("\n")
     assert "scanpy_qc" in out[0]["token"]
     assert "scanpy_qc" in out[1]["text"] and out[1]["type"] == "run_status"
+
+
+def test_a_tool_call_is_said_in_words_never_its_json():
+    # The chat and the run card name the call and its main inputs; the JSON is in
+    # process/tool_calls.jsonl (RCHENLAB/AiScientist#121).
+    out = _lab_event_to_chat({"type": "tool_start", "tool": "run_cellqc", "args": {
+        "species": "mouse", "dataset": "/dfs3b/x/retina.h5ad", "max_pct_mt": 20,
+        "options": {"deep": {"nested": True}}}})
+    token = out[0]["token"]
+    assert token == "→ run_cellqc — dataset retina.h5ad · species mouse · max pct mt 20 · +1 more\n"
+    for p in out:
+        for value in p.values():
+            assert "{" not in str(value) and '":' not in str(value), p
+
+
+def test_run_code_shows_its_code_on_the_run_card_while_it_runs():
+    code = "import scanpy as sc\nadata = sc.read_h5ad(path)\nprint(adata)"
+    out = _lab_event_to_chat({"type": "tool_start", "tool": "run_code", "args": {"code": code}})
+    assert out[0]["token"] == "→ run_code — Python, 3 lines\n", "the activity log says it in words"
+    cmd = out[2]
+    assert cmd["type"] == "run_command" and cmd["state"] == "running" and cmd["code"] == code
+    done = _lab_event_to_chat({"type": "tool_result", "tool": "run_code", "summary": "ok", "args": {"code": code}})
+    assert [p for p in done if p["type"] == "run_command"] == [
+        {"type": "run_command", "tool": "run_code", "state": "done"}]
+    failed = _lab_event_to_chat({"type": "tool_error", "tool": "run_code", "error": "boom"})
+    assert {"type": "run_command", "tool": "run_code", "state": "failed"} in failed
 
 
 def test_model_call_becomes_live_status_only():
@@ -105,7 +145,7 @@ def test_model_call_becomes_live_status_only():
 def test_tool_result_goes_to_activity_only():
     out = _lab_event_to_chat(
         {"type": "tool_result", "tool": "scanpy_qc", "summary": "2000 cells"})
-    assert _kinds(out) == ["chat_thinking"]
+    assert _kinds(out) == ["chat_thinking", "run_command"]
     assert "2000 cells" in out[0]["token"]
 
 
@@ -115,20 +155,20 @@ def test_run_code_success_emits_formatted_code_block():
     out = _lab_event_to_chat(
         {"type": "tool_result", "tool": "run_code", "summary": "ok",
          "args": {"code": "import scanpy as sc\nprint('hi')"}})
-    assert _kinds(out) == ["chat_thinking", "step_code"]
-    assert out[1]["code"].startswith("import scanpy")
+    assert _kinds(out) == ["chat_thinking", "run_command", "step_code"]
+    assert out[2]["code"].startswith("import scanpy")
 
 
 def test_run_code_without_code_has_no_block():
     out = _lab_event_to_chat(
         {"type": "tool_result", "tool": "run_code", "summary": "ok", "args": {}})
-    assert _kinds(out) == ["chat_thinking"]
+    assert _kinds(out) == ["chat_thinking", "run_command"]
 
 
 def test_tool_error_surfaces_as_warning():
     out = _lab_event_to_chat(
         {"type": "tool_error", "tool": "scanpy_qc", "error": "boom"})
-    assert _kinds(out) == ["chat_thinking", "lab_progress"]
+    assert _kinds(out) == ["chat_thinking", "lab_progress", "run_command"]
     assert out[1]["level"] == "warning"
     assert "boom" in out[1]["text"]
 

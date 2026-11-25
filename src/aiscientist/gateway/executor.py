@@ -47,8 +47,9 @@ class RemoteExecutor(Protocol):
         """Download ``remote_path`` to ``local_path`` (used to pull job outputs back)."""
         ...
 
-    def read_bytes(self, remote_path: str, max_bytes: int | None = None) -> bytes:
-        """Read (at most ``max_bytes`` of) a remote file. ``b""`` when missing/unreadable.
+    def read_bytes(self, remote_path: str, max_bytes: int | None = None, offset: int = 0) -> bytes:
+        """Read (at most ``max_bytes`` of) a remote file from byte ``offset``. ``b""`` when
+        missing/unreadable.
 
         Prefer this over ``exec("cat …")`` for file CONTENT: content is a transfer, and on HPC3
         transfers must stay off the login node (see ``SSHExecutor._open_sftp``)."""

@@ -40,6 +40,7 @@ from . import session_state               # what a session is doing with HPC3, s
 from . import storage_delete              # the Storage tab's Delete, as a Slurm job
 from . import shared_llm                  # the lab's shared reasoning-model server and its keeper
 from . import slurm_job                   # the Slurm lifecycle; its job states go to the run's chat
+from . import run_steps                   # step states on the plan cards, the run's tool-call record (#121)
 from . import staging                     # background copies of uploads to HPC3
 from . import upload_storage, dataset_storage
 from . import upload_log                  # what happened to each upload, per user
@@ -199,6 +200,10 @@ _CURRENT_RUN: contextvars.ContextVar["RunState | None"] = contextvars.ContextVar
 # DAG nodes running side by side (each in a copy of the context) each keep their own step.
 _USAGE_STEP: contextvars.ContextVar[str | None] = contextvars.ContextVar(
     "aiscientist_usage_step", default=None)
+# The step of the plan the calling thread works on (``run_steps.step_key``): a Slurm job it submits is
+# that step's job (#121). A DAG node runs in its own thread, so steps that run side by side keep apart.
+_RUN_STEP: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "aiscientist_run_step", default=None)
 # The run a completion is billed to when it is not the connection's active run: the report written
 # later for a finished run (``write_report``, RCHENLAB/AiScientist#102).
 _USAGE_RUN: contextvars.ContextVar[str | None] = contextvars.ContextVar(
@@ -340,6 +345,11 @@ class RunState:
         if self.conversation_id is not None:
             payload.setdefault("conversation_id", self.conversation_id)
         return payload
+
+    def step_states(self) -> list[dict[str, Any]]:
+        """Where each step of this run's plan stands (``run_steps``), in plan order: what the run
+        saves in ``run_state.json``, so the saved run keeps its marks."""
+        return run_steps.ordered_steps((self.stream or {}).get("steps") or {})
 
     def add_injection(self, text: str) -> None:
         with self._inj_lock:
@@ -737,7 +747,8 @@ class Connection:
         if t == "chat_start":
             if run is not None:
                 payload.setdefault("stream_id", run.stream_id)
-            self.stream = {"text": "", "thinking": "", "progress": [], "jobs": {}, "status": "running",
+            self.stream = {"text": "", "thinking": "", "progress": [], "jobs": {}, "steps": {},
+                           "commands": {}, "status": "running",
                            "artifacts": None, "error": "", "status_label": "",
                            "run_id": payload.get("run_id"),
                            "conversation_id": payload.get("conversation_id"),
@@ -764,13 +775,33 @@ class Connection:
             rec = _merge_run_job(s.setdefault("jobs", {}), payload)
             if rec is not None:
                 payload.update(rec)
-        elif t == "chat_done":
-            s["status"] = "done"
-        elif t == "chat_stopped":
-            s["status"] = "stopped"
-        elif t == "chat_error":
-            s["status"] = "error"
-            s["error"] = payload.get("message", "")
+        elif t == "step_state":
+            # Where each step of the plan stands (#121), one record per step: a window that reloads
+            # gets the same marks back (stream_replay_payloads), and the run saves them.
+            rec = run_steps.merge_step_state(s.setdefault("steps", {}), payload)
+            if rec is not None:
+                payload.update(rec)
+        elif t == "run_command":
+            # The command each running step runs now, for the top of the run card (#121).
+            cmds = s.setdefault("commands", {})
+            key = str(payload.get("step_key") or "")
+            if payload.get("state") == "running":
+                cmds[key] = {k: payload[k] for k in ("tool", "words", "code", "step_key") if payload.get(k)}
+                cmds[key].update(state="running", started_at=time.time())
+            elif key in cmds and cmds[key].get("tool") == payload.get("tool"):
+                cmds[key].update(state=payload.get("state"), ended_at=time.time())
+                payload.update(cmds[key])
+        elif t in ("chat_done", "chat_stopped", "chat_error"):
+            s["status"] = {"chat_done": "done", "chat_stopped": "stopped", "chat_error": "error"}[t]
+            if t == "chat_error":
+                s["error"] = payload.get("message", "")
+            # A step still running did not finish; the console marks it the same way on its own.
+            # A turn that only ended for a plan to be reviewed has run no step yet.
+            if not payload.get("awaiting_plan"):
+                run_steps.finish_step_states(s.setdefault("steps", {}))
+                for cmd in list((s.get("commands") or {}).values()):
+                    if cmd.get("state") == "running":
+                        cmd["state"] = "stopped"
         elif t == "artifacts":
             s["artifacts"] = payload
             m = re.search(r"/api/bundle/[^/]+/([^/]+)", payload.get("bundle_url", "") or "")
@@ -812,6 +843,11 @@ class Connection:
                             "level": p.get("level", "info")})
         for rec in (s.get("jobs") or {}).values():
             out.append({"type": "run_job", **rec})
+        # The marks of the plan's steps and the command each step runs, as they are now (#121).
+        for rec in run_steps.ordered_steps(s.get("steps") or {}):
+            out.append({"type": "step_state", **rec})
+        for cmd in list((s.get("commands") or {}).values()):
+            out.append({"type": "run_command", **cmd})
         if s["text"]:
             out.append({"type": "chat_token", "token": s["text"]})
         if s["status"] == "running" and s.get("status_label"):
@@ -5559,6 +5595,207 @@ def _stage_secondary_dataset(conn: Connection, path: str, name: str, role: "str 
             "hpc_primary": None, "remote": False, "primary": False}
 
 
+def _plan_dataset_catalogue(conn: Connection) -> list[dict]:
+    """The datasets this account can name in a plan under review (RCHENLAB/AiScientist#120): its own
+    uploads, newest first, and the lab's shared datasets with their versions and the files of each
+    published one (``agents/plan_datasets.py``). Read in the lab's thread, when a reply asks for a
+    look-up and when a step's dataset is checked. No server path: it goes into prompts and onto the
+    plan card."""
+    out: list[dict] = []
+    if _AUTH_ENABLED and conn.app_user_id:
+        from sqlalchemy import select
+
+        from .db import session_scope
+        from .models import Dataset
+        # Each with its id and upload date: two uploads may share a name (two
+        # filtered_feature_bc_matrix.h5), and the planner must be able to tell them apart.
+        with session_scope() as s:
+            rows = s.scalars(select(Dataset).where(Dataset.user_id == int(conn.app_user_id))
+                             .order_by(Dataset.id.desc())).all()
+            for d in rows:
+                if str(d.status or "complete") != "complete":
+                    continue
+                out.append({"source": "own", "id": str(d.uuid or d.id), "name": d.name,
+                            "kind": d.kind or "file", "size_bytes": int(d.size_bytes or 0),
+                            "uploaded": d.uploaded_at.date().isoformat() if d.uploaded_at else ""})
+    from . import shared_datasets as sd
+    if sd.store_root() is not None:
+        for view in sd.dataset_views():
+            versions = []
+            for v in view.get("versions") or []:
+                files: list[dict] = []
+                if v.get("status") == "published":
+                    try:
+                        files = sd.version_view(view["slug"], v["label"])["version"]["files"]
+                    except sd.SharedDatasetError:
+                        continue
+                versions.append({"label": v["label"], "status": v.get("status") or "published",
+                                 "files": [{"name": f["name"], "facets": f.get("facets") or {}} for f in files]})
+            out.append({"source": "shared", "id": view["slug"], "name": view["name"],
+                        "description": view.get("description") or "", "latest": view.get("latest") or "",
+                        "versions": versions})
+    return out
+
+
+#: What a run's start writes into its decisions about its inputs: read again, from the datasets now
+#: bound, when an approved plan chose datasets in review.
+_STAGED_INPUT_KEYS = (
+    "dataset_path", "dataset_result", "dataset_root", "datasets", "hpc_dataset_root", "hpc_primary",
+    "server_primary", "input_folders", "input_name", "cellranger_layout", "content_confidence",
+    "content_modality", "dataset_description", "dataset_metadata", "metadata_inputs", "shared_inputs",
+    "shared_members", "unusable_inputs")
+
+
+class _PlanBindRefused(Exception):
+    """An approved plan names a dataset that cannot be attached to its chat; the message says why."""
+
+
+def _plan_chosen_inputs(conn: Connection, state: dict, plan_yaml: str) -> "dict | None":
+    """The datasets an approved plan names that its chat has not attached (RCHENLAB/AiScientist#120),
+    as the run options that bind them: ``{"datasets", "shared_datasets", "own_ids", "attached",
+    "primary"}``. ``None`` when the plan names none, or only datasets the run already reads.
+
+    A dataset is chosen in review by naming it in a step's ``dataset``; approving the plan attaches
+    it, so the run reads that one. In a chat with no dataset the first one the plan names becomes the
+    main dataset (the one the tools read); in a chat that has one, it stays the main dataset and the
+    new ones are extra inputs. Raises :class:`_PlanBindRefused` for a dataset that is no longer there."""
+    from ..agents import plan_datasets
+    from ..agents.plan_doc import PlanError, parse_plan_yaml
+    from . import shared_datasets as sd
+
+    try:
+        refs = plan_datasets.plan_datasets(parse_plan_yaml(plan_yaml).steps)
+    except PlanError:
+        return None
+    if not refs:
+        return None
+    options = dict(state.get("run_options") or {})
+    own = [dict(d) for d in options.get("datasets") or [] if isinstance(d, dict) and d.get("path")]
+    if not own and options.get("dataset_path"):
+        path = str(options["dataset_path"])
+        own = [{"path": path, "name": path.rsplit("/", 1)[-1], "role": None}]
+    shared = [dict(s) for s in options.get("shared_datasets") or [] if isinstance(s, dict) and s.get("shared")]
+    nothing_bound = not own and not shared
+    records = (auth_routes.list_dataset_records(int(conn.app_user_id))
+               if _AUTH_ENABLED and conn.app_user_id else [])
+    by_uuid = {str(r.get("uuid")): r for r in records}
+    attached: list[str] = []
+    own_ids: list[int] = []
+    primary = ""
+    planned_versions: dict[str, str] = {}
+
+    def label_of(slug: str, version: str) -> str:
+        """The version label a reference means now: ``latest`` read as the label it points at."""
+        if version and version != sd.LATEST:
+            return version
+        try:
+            return str(sd.version_view(slug, sd.LATEST)["version"]["label"])
+        except sd.SharedDatasetError as exc:
+            raise _PlanBindRefused(str(exc)) from None
+
+    for ref in refs:
+        role = "primary" if nothing_bound and not primary else None
+        if ref.get("source") == "own":
+            rec = by_uuid.get(str(ref.get("id") or ""))
+            if rec is None:
+                named = [r for r in records if r["name"] == ref.get("name")]
+                if len(named) > 1:
+                    raise _PlanBindRefused(f"Two of your datasets are named {ref.get('name')}. Give the step's "
+                                           "dataset the id of the one to read, then run the plan.")
+                rec = named[0] if named else None
+            if rec is None:
+                raise _PlanBindRefused(f"The plan reads {ref.get('name')}, which is not among your datasets any "
+                                       "more. Change the step's dataset, then run the plan.")
+            if any(d.get("path") == rec["path"] for d in own):
+                continue
+            own.append({"path": rec["path"], "name": rec["name"], "role": role or "extra_input"})
+            own_ids.append(int(rec["id"]))
+        elif ref.get("source") == "shared":
+            if sd.store_root() is None:
+                raise _PlanBindRefused("Shared datasets are not enabled on this server.")
+            slug, name = str(ref.get("id") or ""), str(ref.get("name") or ref.get("id") or "")
+            version = label_of(slug, str(ref.get("version") or sd.LATEST))
+            files = [str(ref["file"])] if ref.get("file") else None
+            # A run reads one version of a dataset (one attachment per dataset), so two versions are
+            # refused with the reason, never one silently read in place of the other.
+            if planned_versions.setdefault(slug, version) != version:
+                raise _PlanBindRefused(f"The plan reads two versions of {name} ({planned_versions[slug]} and "
+                                       f"{version}). A run reads one version of a dataset: make the steps "
+                                       "name the same version, then run the plan.")
+            have = next((s for s in shared if s.get("shared") == slug), None)
+            if have is not None:
+                requested = str(have.get("version") or sd.LATEST)
+                held_label = label_of(slug, requested)
+                if held_label != version:
+                    raise _PlanBindRefused(
+                        f"The plan reads {name} {version}, but this chat has {name} {held_label} attached"
+                        + (" (its latest version)" if requested == sd.LATEST else "")
+                        + f". A run reads one version of a dataset: set the step's version to {held_label}, "
+                        f"or attach {version} to the chat instead, then run the plan.")
+                held = have.get("files")
+                if held is None or (files is not None and set(files) <= set(held)):
+                    continue
+                have.update(files=None if files is None else list(dict.fromkeys([*held, *files])))
+            else:
+                shared.append({"shared": slug, "version": version, "files": files,
+                               "role": role or "reference"})
+        else:
+            continue
+        attached.append(plan_datasets.describe(ref))
+        primary = primary or (plan_datasets.describe(ref) if role else "")
+    if not attached:
+        return None
+    return {"datasets": own, "shared_datasets": shared, "own_ids": own_ids, "attached": attached,
+            "primary": primary}
+
+
+def _attach_plan_inputs(conn: Connection, conversation_id: "str | None", chosen: dict) -> "dict | None":
+    """Attach the datasets a plan chose to its chat, as the chat's data menu would (own rows and
+    shared references), so the chat shows them and the next message reads them too. The chat's
+    attachments after it, for the console; ``None`` without an account or a saved chat."""
+    if not (_AUTH_ENABLED and conn.app_user_id and str(conversation_id or "").isdigit()):
+        return None
+    from sqlalchemy import select
+
+    from . import shared_datasets as sd
+    from .db import session_scope
+    from .models import Conversation, ConversationDataset
+
+    cid, uid = int(conversation_id), int(conn.app_user_id)
+    with session_scope() as s:
+        conv = s.get(Conversation, cid)
+        if conv is None or conv.user_id != uid:
+            return None
+        roles = {d["path"]: d.get("role") for d in chosen["datasets"]}
+        held = {row.dataset_id for row in conv.datasets}
+        for dataset_id in chosen["own_ids"]:
+            if dataset_id in held:
+                continue
+            from .models import Dataset
+            row = s.get(Dataset, dataset_id)
+            role = roles.get(row.path) if row is not None else None
+            if role == "primary":
+                for other in conv.datasets:
+                    if other.role == "primary":
+                        other.role = None
+            conv.datasets.append(ConversationDataset(dataset_id=dataset_id, position=len(conv.datasets),
+                                                     role=role if role in ("primary", "reference", "sample",
+                                                                           "extra_input") else None))
+        s.flush()
+        shared = sd.attachment_views(s, cid)
+        if chosen["shared_datasets"] and sd.store_root() is not None:
+            shared = sd.replace_attachments(
+                s, cid, [{"shared": a["shared"], "version": a.get("version") or sd.LATEST,
+                          "files": a.get("files"), "role": a.get("role") or "reference"}
+                         for a in chosen["shared_datasets"]],
+                other_attached=len(conv.datasets), limit=_MAX_BOUND_DATASETS)
+        conv.updated_at = datetime.now(timezone.utc)
+        s.commit()
+        own = [d.public() for d in s.scalars(select(ConversationDataset).where(
+            ConversationDataset.conversation_id == cid).order_by(ConversationDataset.position)).all()]
+    return {"datasets": own, "shared_datasets": shared, "max_bound_datasets": _MAX_BOUND_DATASETS}
+
+
 def _plan_dataset_inputs(decisions: dict, primary_name: str = "") -> dict:
     """The staged inputs and actual QC grouping shown before a plan runs.
 
@@ -7370,11 +7607,26 @@ async def chat_stop(req: StopRequest, request: Request) -> JSONResponse:
         print(f"[chat_stop] no-op: req(run_id={req.run_id!r}, conversation_id={req.conversation_id!r}) "
               f"matched none of the runs in flight {live!r}.")
         return JSONResponse({"status": "idle"})
-    # Pressing Stop on a run that is ALREADY stopping means the write-up too. The first Stop only
-    # ends the analysis loop; everything after it (report, self-review, render, post-render
-    # reviews, technical report) runs regardless, by design, so a stopped run still ships what
-    # completed. Nobody could decline that tail, and it is the expensive half on a metered model.
+    escalated = _stop_run(conn, target)
+    if escalated:
+        conn.emit("warning", "chat",
+                  "Stop again — skipping the report write-up. The analysis results already "
+                  "written to disk are kept.", run=target)
+        return JSONResponse({"status": "abandoning"})
+    conn.emit("info", "chat", "Stop requested — ending the current run.", run=target)
+    return JSONResponse({"status": "stopping"})
+
+
+def _stop_run(conn: "Connection", target: "RunState", *, escalate: bool = True) -> bool:
+    """What Stop does to a run; returns whether it was already stopping.
+
+    Pressing Stop on a run that is ALREADY stopping means the write-up too (``escalate``). The first
+    Stop only ends the analysis loop; everything after it (report, self-review, render, post-render
+    reviews, technical report) runs regardless, by design, so a stopped run still ships what
+    completed. Nobody could decline that tail, and it is the expensive half on a metered model."""
     escalated = target.chat_stop.is_set()
+    if escalated and not escalate:
+        return True
     if target.monitor is not None:
         target.monitor.timing_event("stop_requested", action="hard_stop" if escalated else "stop")
     target.chat_stop.set()
@@ -7384,13 +7636,20 @@ async def chat_stop(req: StopRequest, request: Request) -> JSONResponse:
     # A run blocked at a plan-review or decision-point card is waiting on plan_event, NOT watching
     # chat_stop: the pending wait is resolved as a cancel, exactly as /api/lab/plan would.
     _cancel_pending_plan(conn, target)
-    if escalated:
-        conn.emit("warning", "chat",
-                  "Stop again — skipping the report write-up. The analysis results already "
-                  "written to disk are kept.", run=target)
-        return JSONResponse({"status": "abandoning"})
-    conn.emit("info", "chat", "Stop requested — ending the current run.", run=target)
-    return JSONResponse({"status": "stopping"})
+    return escalated
+
+
+def _abort_answer(target: "RunState | None", action: str, feedback: str) -> bool:
+    """Whether an answer to a run's card is "Abort the run", the option a failed step's decision
+    point offers. It ends the run as Stop does, whatever the run is doing when it arrives. Run
+    6e5a33230a46's Abort did not: the run was running tool calls, not waiting at a card (a card
+    that timed out stayed on screen), so the answer was nobody's, and the run went on until Stop
+    was pressed a minute later. A plan card is never answered this way: it has Cancel."""
+    from ..agents.research_lab import ABORT_RUN_OPTION
+    if target is None or action != "revise" or (feedback or "").strip().lower() != ABORT_RUN_OPTION.lower():
+        return False
+    pending = target.pending_plan
+    return pending is None or (isinstance(pending, dict) and pending.get("kind") == "decision")
 
 
 class InjectRequest(BaseModel):
@@ -11530,8 +11789,9 @@ async def _run_quick_chat(conn: Connection, req: LabRequest) -> None:
                 conn.push({"type": "chat_thinking", "token": ev.get("token", "")})
             elif t == "tool_start":
                 conn.push({"type": "run_status", "text": f"⚙️ {ev.get('tool')}…"})
+                # In words, never the call's JSON (RCHENLAB/AiScientist#121).
                 conn.push({"type": "chat_thinking",
-                           "token": f"→ {ev.get('tool')}({json.dumps(ev.get('args', {}))[:80]})\n"})
+                           "token": f"→ {run_steps.tool_call_words(ev.get('tool'), ev.get('args'))}\n"})
             elif t == "tool_result":
                 conn.push({"type": "chat_thinking",
                            "token": f"✓ {ev.get('tool')}: {ev.get('summary', '')}\n"})
@@ -11746,9 +12006,11 @@ def _literature_corpus_logged(conn: Connection, run: RunState, corpus: "tuple[An
         run.monitor.observe({"type": "tool_start", "tool": lit.CORPUS_TOOL})
     conn.push({"type": "run_status", "text": "📚 RetiGene corpus: searching the full text…"})
     # The arguments the search really ran with, in the activity log: a report that says "12
-    # passages" can then be read against the budget that produced it (issue 60).
-    log_args = {"terms": list(terms), "top_k": args["top_k"], "max_per_paper": args["max_per_paper"]}
-    conn.push({"type": "chat_thinking", "token": f"→ {lit.CORPUS_TOOL}({json.dumps(log_args, ensure_ascii=False)})\n"})
+    # passages" can then be read against the budget that produced it (issue 60), every term of it.
+    # In words, not JSON (RCHENLAB/AiScientist#121).
+    said = (f"terms {', '.join(terms)} · " if terms else "") + \
+        f"top k {args['top_k']} · max per paper {args['max_per_paper']}"
+    conn.push({"type": "chat_thinking", "token": f"→ {lit.CORPUS_TOOL} — {said}\n"})
     try:
         out = tool.executor(args, ctx)
     except Exception as exc:  # noqa: BLE001 - the answer falls back to PubMed alone
@@ -11773,7 +12035,7 @@ def _literature_search_logged(conn: Connection, run: RunState, queries: list[str
         if run.monitor is not None:
             run.monitor.observe({"type": "tool_start", "tool": lit.TOOL})
         conn.push({"type": "run_status", "text": f"🔎 PubMed: {query}"})
-        conn.push({"type": "chat_thinking", "token": f"→ {lit.TOOL}({json.dumps({'query': query})})\n"})
+        conn.push({"type": "chat_thinking", "token": f"→ {run_steps.tool_call_words(lit.TOOL, {'query': query})}\n"})
         from .literature_mcp import registered_server
         if registered_server() is not None:
             route = getattr(run, "literature_mcp", None)
@@ -12433,11 +12695,12 @@ def _saved_plan_replays(conn: Connection) -> list[dict[str, Any]]:
 
 
 async def _continue_saved_plan(conn: Connection, req: LabRequest, run_id: str,
-                               state: dict, decision: dict, version: int) -> None:
+                               state: dict, decision: dict, version: int, *,
+                               chosen: "dict | None" = None) -> None:
     art = conn.workspace / run_id / "artifacts"
     try:
         await _run_lab(conn, req, resume_run_id=run_id, saved_state=state,
-                       saved_decision=decision)
+                       saved_decision=decision, chosen_inputs=chosen)
     finally:
         _SAVED_PLAN_TASKS.discard(art)
         _keep_saved_plan_waiting(conn, run_id, art, state, version)
@@ -12492,6 +12755,13 @@ async def lab_plan_review(req: PlanReviewRequest, request: Request) -> JSONRespo
     # session. A decision that names a run that isn't active (a stale plan card from a finished run) is
     # a no-op. No identifiers (older client) → the active run.
     target = conn.resolve_run(req.run_id, req.conversation_id)
+    if _abort_answer(target, action, req.feedback or ""):
+        # The run ends as Stop ends it: the card waiting for this answer (if any) is answered with a
+        # cancel, a running tool call is cancelled, and the run reports what it finished.
+        already = _stop_run(conn, target, escalate=False)
+        if not already:
+            conn.emit("info", "chat", "Abort the run — ending the current run.", run=target)
+        return JSONResponse({"status": "stopping", "action": "abort"})
     # In-run decisions still have a waiting worker. Initial plan review has no live scope. A saved
     # plan is found only by its run or its chat: a decision that names neither (an older client)
     # must not land on whichever chat's plan was saved last.
@@ -12525,7 +12795,28 @@ async def lab_plan_review(req: PlanReviewRequest, request: Request) -> JSONRespo
         options = dict(state.get("run_options") or {})
         options.update(connection_id=conn.id, conversation_id=state.get("conversation_id"),
                        question=state.get("question", ""))
+        # The datasets the plan chose while it was reviewed are attached to the chat now, so the run
+        # reads them (RCHENLAB/AiScientist#120); the run stages them as a new run would.
+        chosen = None
+        if action == "approve" and current["kind"] == "agenda":
+            try:
+                chosen = await asyncio.to_thread(_plan_chosen_inputs, conn, state, current["yaml"])
+            except _PlanBindRefused as exc:
+                return JSONResponse({"error": str(exc)}, status_code=409)
+            if chosen is not None:
+                options.update(datasets=chosen["datasets"], shared_datasets=chosen["shared_datasets"],
+                               dataset_path=None)
         cont_req = LabRequest(**options)
+        if chosen is not None:
+            try:
+                if cont_req.shared_datasets:
+                    cont_req._shared_resolved = await asyncio.to_thread(_resolve_shared_refs, cont_req, conn)
+                _select_bound_datasets(cont_req)
+            except HTTPException as exc:
+                return JSONResponse({"error": str(exc.detail)}, status_code=409)
+            views = await asyncio.to_thread(_attach_plan_inputs, conn, state.get("conversation_id"), chosen)
+            if views is not None:
+                conn.push({"type": "chat_datasets", "conversation_id": state.get("conversation_id"), **views})
         # The task loads the current document again, rather than using a copy from the card.
         _SAVED_PLAN_TASKS.add(art)
         _saved_plan_timing(conn, run_id).decision(action)
@@ -12534,7 +12825,7 @@ async def lab_plan_review(req: PlanReviewRequest, request: Request) -> JSONRespo
         _note_budget_choice(conn.begin_run(state.get("conversation_id"), run_id=run_id), req)
         conn.push({"type": "plan_done"})
         asyncio.create_task(_continue_saved_plan(conn, cont_req, run_id, state, decision,
-                                                 current["version"]))
+                                                 current["version"], chosen=chosen))
         return JSONResponse({"status": "ok", "action": action, "run_id": run_id})
     if target is None:
         return JSONResponse({"status": "not_delivered", "action": "ignored",
@@ -12823,10 +13114,23 @@ def _note_usage_step(ev: dict[str, Any], flags: dict[str, Any]) -> None:
         flags["usage_agenda"] = [" ".join(str(s).split()) for s in ev.get("agenda") or []]
     if t in ("planning", "pi_agenda"):
         _USAGE_STEP.set("Planning")
+    elif t == "step_state" and ev.get("state") == "processing":
+        # The step this thread runs now, by its number in the approved plan: its Slurm jobs and model
+        # calls are labelled with it, and a job it submits is shown on the step (#121).
+        _RUN_STEP.set(run_steps.step_key(ev))
+        step = " ".join(str(ev.get("text") or "").split())
+        n = ev.get("step")
+        _USAGE_STEP.set((f"Step {n}: " if isinstance(n, int) else "Step: ") + step[:140])
+    elif t == "step_state" and _RUN_STEP.get() == run_steps.step_key(ev):
+        # The step this thread ran is over: a job submitted after it (the write-up) is not its job.
+        _RUN_STEP.set(None)
     elif t == "scientist_start":
         step = " ".join(str(ev.get("step") or "").split())
         agenda = flags.get("usage_agenda") or []
         n = agenda.index(step) + 1 if step in agenda else None
+        # A DAG node's brief is its step with reuse hints: the label its step_state set is better.
+        if n is None and _RUN_STEP.get():
+            return
         _USAGE_STEP.set((f"Step {n}: " if n else "Step: ") + step[:140])
     elif t == "synthesize":
         _USAGE_STEP.set("Write-up")
@@ -12844,7 +13148,15 @@ def _push_slurm_job(update: dict[str, Any]) -> None:
     step = _USAGE_STEP.get()
     if step and not payload.get("step"):
         payload["step"] = " ".join(step.split())[:160]
+    key = _RUN_STEP.get()
+    if key:
+        payload["step_key"] = key
     conn.push(payload, run=run)
+    # The job is the step's: the plan cards and the run card name it with the step (#121). Sent when
+    # the step's job changes (its latest job is the one shown); the job's own states are in run_job.
+    steps = (run.stream or {}).get("steps") or {}
+    if key and key in steps and steps[key].get("job_id") != str(update.get("job_id") or ""):
+        conn.push({"type": "step_state", "key": key, "job_id": update.get("job_id")}, run=run)
 
 
 slurm_job.set_job_observer(_push_slurm_job)
@@ -13378,6 +13690,7 @@ _BIND_DROPPED_WHY = {
     "not_in_text": "the step's text does not state it",
     "multiple_choices_in_text": "the step names more than one of its choices",
     "incomplete_list": "the step names items this list leaves out",
+    "per_library": "one value for several libraries; the tool reads it from each library",
 }
 
 
@@ -13417,6 +13730,21 @@ def _lab_event_to_chat(ev: dict[str, Any]) -> list[dict[str, Any]]:
 
     if t == "step_provenance":
         out.append(dict(ev))
+    elif t == "step_state":
+        # Where a step of the plan stands (RCHENLAB/AiScientist#121): both plan cards mark it. The
+        # Connection keeps the latest record of each step with the run's stream (run_steps).
+        st = str(ev.get("state") or "")
+        if st in run_steps.STEP_STATES:
+            payload = {"type": "step_state", "state": st}
+            for k in ("id", "step", "index", "text", "reason"):
+                if ev.get(k) not in (None, ""):
+                    payload[k] = ev[k]
+            out.append(payload)
+        # A step kept from the run this one continues failed back then; it is not said again.
+        if st == "failed" and ev.get("reason") != run_steps.KEPT_REASON:
+            n = ev.get("step")
+            progress(f"⚠️ Step{f' {n}' if isinstance(n, int) else ''} ended without an accepted result: "
+                     f"{run_steps.step_title(str(ev.get('text') or ''))[:80]}.", "warning")
     elif t == "pi_agenda":
         agenda = list(ev.get("agenda") or [])
         progress(f"📋 Plan ready — {len(agenda)} step{'s' if len(agenda) != 1 else ''}")
@@ -13442,15 +13770,23 @@ def _lab_event_to_chat(ev: dict[str, Any]) -> list[dict[str, Any]]:
         status(f"🧠 Model is reasoning{f' — turn {step}' if step else ''}…")
     elif t == "tool_start":
         # Tool chatter (incl. the noisy run_code loop) lives ONLY in the collapsible
-        # activity log — it no longer floods the always-visible key-progress feed.
-        activity(f"→ {ev.get('tool')}({json.dumps(ev.get('args', {}))[:80]})")
+        # activity log — it no longer floods the always-visible key-progress feed. Said in words:
+        # the JSON of a call is in process/tool_calls.jsonl, never in the chat (#121).
+        tool = str(ev.get("tool") or "")
+        words = run_steps.tool_call_words(tool, ev.get("args"))
+        activity(f"→ {words}")
         # ...but DO drive the live status: "running run_code" is the other silent window.
-        status(f"⚙️ Running {ev.get('tool')}…")
+        status(f"⚙️ Running {tool}…")
+        # The run card shows the command being run now, while it runs (#121).
+        out.append({"type": "run_command", "tool": tool, "state": "running", "words": words,
+                    "code": run_steps.command_of(tool, ev.get("args"))})
     elif t == "tool_result":
         tool = ev.get("tool")
         summary = str(ev.get("summary", "")).strip()
         mark = "⏹" if ev.get("timing_outcome") == "cancelled" else "✓"     # a tool Stop ended
         activity(f"{mark} {tool}: {summary}")
+        out.append({"type": "run_command", "tool": str(tool or ""),
+                    "state": "stopped" if ev.get("timing_outcome") == "cancelled" else "done"})
         # For run_code, surface the FINAL successful snippet as a formatted code block; the
         # last success in a step overwrites the earlier ones on the client.
         if tool == "run_code":
@@ -13461,6 +13797,7 @@ def _lab_event_to_chat(ev: dict[str, Any]) -> list[dict[str, Any]]:
         err = redact_server_paths(str(ev.get("error")))[:160]
         activity(f"⚠ {ev.get('tool')}: {err}")
         progress(f"  ⚠ {ev.get('tool')} failed: {err}", "warning")
+        out.append({"type": "run_command", "tool": str(ev.get("tool") or ""), "state": "failed"})
     elif t == "finish":
         # The Scientist's own summary of what THIS step found — surface it so the user
         # sees the intermediate result, not just a later "✅ Step accepted" line.
@@ -13604,6 +13941,17 @@ def _lab_event_to_chat(ev: dict[str, Any]) -> list[dict[str, Any]]:
     elif t == "tool_warnings":
         for w in list(ev.get("warnings") or [])[:4]:
             progress(f"⚠️ {str(w)[:300]}", level="warning")
+    elif t == "plan_reply_read":
+        kinds = [str(p.get("kind")) for p in ev.get("parts") or [] if isinstance(p, dict)]
+        activity("read your reply as " + (" + ".join(dict.fromkeys(kinds)) or "a change")
+                 + (" (by the word lists: the model's reading was not available)"
+                    if ev.get("source") == "words" else ""))
+    elif t == "plan_question" and ev.get("then_change"):
+        progress(f"❓ Your question — answering it first, then making the change you asked for: "
+                 f"{str(ev.get('text', ''))[:200]}")
+        out.append({"type": "plan_status", "state": "answering",
+                    "text": "❓ Answering your question first, then making the change you asked for."})
+        status("❓ The PI is answering your question, then changing the plan as you asked…")
     elif t == "plan_question":
         progress(f"❓ Your question — answering it; the plan is unchanged: "
                  f"{str(ev.get('text', ''))[:200]}")
@@ -13616,6 +13964,11 @@ def _lab_event_to_chat(ev: dict[str, Any]) -> list[dict[str, Any]]:
         out.append({"type": "plan_status", "state": "answering",
                     "text": "❓ Answering your question — the plan is NOT being changed."})
         status("❓ The PI is answering your question — the plan is unchanged (this can take a while)…")
+    elif t == "plan_answer" and ev.get("then_change"):
+        # A reply that asked and asked for a change: the answer now, the change after it.
+        out.append({"type": "chat_token", "token": "\n" + str(ev.get("answer", "")).strip() + "\n"})
+        out.append({"type": "plan_status", "state": "answered",
+                    "text": "📋 Answered — now making the change you asked for."})
     elif t == "plan_answer":
         # Rendered as a chat answer, not a feed line: it is a reply to the person, and burying it
         # in the technical feed would make asking feel like nothing happened.
@@ -13623,6 +13976,25 @@ def _lab_event_to_chat(ev: dict[str, Any]) -> list[dict[str, Any]]:
         out.append({"type": "plan_status", "state": "answered",
                     "text": "📋 Answered — the plan below is unchanged."})
         progress("📋 Plan unchanged — approve it, ask something else, or say what to change.")
+    elif t == "plan_lookup":
+        # What the planner looked up before revising (RCHENLAB/AiScientist#120), in the chat: the
+        # researcher sees which datasets it could choose from, not only the step it chose.
+        found = str(ev.get("found") or "").strip()
+        out.append({"type": "chat_token", "token": (
+            "\nI looked for datasets you can use (your data and the shared datasets):\n" + found + "\n"
+            if found else
+            "\nI looked for datasets you can use and found none in your data or the shared datasets.\n"
+            if ev.get("available", True) else
+            "\nDatasets cannot be looked up on this server.\n")})
+        status("🔎 Looked up the datasets you can use…")
+    elif t == "plan_refused":
+        # A change the reviser could not carry out: said in words, and the plan is shown as it was.
+        out.append({"type": "chat_token",
+                    "token": "\nNothing was changed: " + str(ev.get("reason") or "").strip() + "\n"})
+        out.append({"type": "plan_status", "state": "refused",
+                    "text": "📋 Nothing was changed — the plan below is as it was."})
+        progress("📋 Plan unchanged — the change could not be made. Approve it, ask, or say what to change.",
+                 level="warning")
     elif t == "plan_downstream_stale":
         steps = ", ".join(str(n) for n in (ev.get("steps") or []))
         progress(f"🔗 You changed {ev.get('param')} from {ev.get('before')} to {ev.get('after')} in "
@@ -13764,9 +14136,23 @@ def _lab_event_to_chat(ev: dict[str, Any]) -> list[dict[str, Any]]:
         progress(f"🔗 Plan repaired — enrichment was scheduled with no step producing a DE table; "
                  f"inserted a contrast step before step {ev.get('before_step')}: "
                  f"{str(ev.get('inserted') or '')[:160]}", level="warning")
+    elif t == "steps_unavailable":
+        # A step no tested tool or skill does, held while model-written code is off
+        # (agents/research_lab/code_gate.py). The plan card lists the same lines.
+        from ..agents.code_policy import NotAvailable
+        for row in list(ev.get("steps") or [])[:8]:
+            progress("🚫 " + NotAvailable.from_dict(row).line(recorded=bool(ev.get("recorded"))),
+                     level="warning")
+    elif t == "plan_not_available":
+        progress("🚫 No step of this plan has a tested tool or skill, so nothing runs and no job is "
+                 "submitted.", level="warning")
+    elif t == "steps_pruned" and ev.get("reason") == "model_written_code":
+        progress(f"✂️ Not proposed: {len(ev.get('dropped') or [])} step(s) that would need code the AI "
+                 "writes, which this deployment does not run.")
     elif t == "plan_tooling":
         # Shown BEFORE the approve button, because every one of these is a step that would have
         # failed (or silently improvised) only after the reviewer had already committed the compute.
+        from ..agents.code_policy import model_written_code
         for f in list(ev.get("findings") or [])[:8]:
             kind, tool, detail = f.get("kind"), f.get("tool"), str(f.get("detail") or "")
             if kind == "renamed":
@@ -13780,10 +14166,14 @@ def _lab_event_to_chat(ev: dict[str, Any]) -> list[dict[str, Any]]:
             elif kind == "bad_value":
                 progress(f"🧪 `{tool}`: {detail}. The value is outside what the tool accepts, so "
                          f"this step cannot run as written.", level="warning")
-            else:
+            elif model_written_code():
                 progress(f"🧪 `{tool}`: not in the tool catalog — the step will be IMPROVISED with "
                          f"`run_code` (allowed). Before approving, check it is not re-making "
                          f"something an existing tool or the automatic report already produces.",
+                         level="warning")
+            else:
+                # The step is held as not available (steps_unavailable says so); nothing improvises it.
+                progress(f"🧪 `{tool}`: not in the tool catalog — no tested tool runs this step.",
                          level="warning")
     elif t == "team_meeting_start":
         members = ", ".join(str(m) for m in (ev.get("members") or []))
@@ -13887,6 +14277,10 @@ def _lab_event_to_chat(ev: dict[str, Any]) -> list[dict[str, Any]]:
                 lines.append(f"   step {c.get('before')} moved to position {n}")
             elif kind == "tool":
                 lines.append(f"   step {n}: tool `{c.get('before') or '—'}` → `{c.get('after') or '—'}`")
+            elif kind == "dataset":
+                from ..agents.plan_datasets import describe as _dataset_words
+                lines.append(f"   step {n} reads " + (_dataset_words(c.get("after")) or "no named dataset")
+                             + (f" (was {_dataset_words(c.get('before'))})" if c.get("before") else ""))
             else:
                 lines.append(f"   step {n}: {kind} rewritten")
         progress(("✏️ The plan was changed as you asked — every step not listed here is unchanged.\n"
@@ -13917,6 +14311,17 @@ def _lab_event_to_chat(ev: dict[str, Any]) -> list[dict[str, Any]]:
         for o in list(ev.get("overrode") or [])[:6]:
             progress(f"📌 `{ev.get('tool')}`: used {o.get('param')} = {o.get('approved')!r} from the "
                      f"approved plan (the model sent {o.get('model')!r}).", level="warning")
+    elif t == "plan_setting_per_library":
+        held = dict(ev.get("settings") or {})
+        libs = [str(x) for x in ev.get("libraries") or []]
+        if held:
+            one = len(held) == 1
+            progress(f"📌 `{ev.get('tool')}`: "
+                     + ", ".join(f"{k} = {v!r}" for k, v in list(held.items())[:6])
+                     + f" from the plan {'is one value' if one else 'are single values'} for "
+                       f"{len(libs)} libraries, so {'it is' if one else 'they are'} not applied to every "
+                       f"call: each call sets {'it' if one else 'them'} for its own libraries, or CellQC "
+                       f"reads {'it' if one else 'them'} from each library.", level="warning")
     elif t == "plan_adherence":
         rows = list(ev.get("steps") or [])
         off = [r for r in rows if r.get("status") != "as_planned"]
@@ -14024,27 +14429,29 @@ def _lab_event_to_chat(ev: dict[str, Any]) -> list[dict[str, Any]]:
         icon = {"supported": "✅", "refuted": "❌"}.get(str(ev.get("status")), "◑")
         progress(f"{icon} Hypothesis [{ev.get('id')}] {ev.get('status')}: "
                  f"{str(ev.get('evidence') or ev.get('statement', ''))[:220]}")
+    # How the scheduler works (the dependency plan, the Coordinator, an expert claiming a task,
+    # parallel batches, expert memory) is for whoever opens the activity log, not the progress list:
+    # a user follows the steps themselves, on the plan cards (RCHENLAB/AiScientist#121).
     elif t == "lab_plan_dag":
         # DAG planner: the reviewed steps have been structured into a dependency graph the
         # scheduler runs by readiness (instead of a fixed order).
         nodes = list(ev.get("nodes") or [])
         n_dep = sum(1 for n in nodes if n.get("depends_on"))
-        progress(f"🕸 Structured {len(nodes)} task(s) into a dependency plan "
+        activity(f"🕸 Structured {len(nodes)} task(s) into a dependency plan "
                  f"({n_dep} with prerequisites) — running them by readiness.")
     elif t == "coordinator_pick":
         ready = list(ev.get("ready") or [])
-        activity(f"Coordinator → {ev.get('next')} (from ready {ready})")
-        progress(f"🧭 Coordinator chose the next task from {len(ready)} ready option(s).")
+        activity(f"🧭 Coordinator chose {ev.get('next')} from {len(ready)} ready task(s) {ready}.")
     elif t == "node_claim":
         # Real multi-agent: an expert claimed this task by expertise fit.
-        progress(f"🙋 {str(ev.get('specialist', 'An expert'))} claimed this task.")
+        activity(f"🙋 {str(ev.get('specialist', 'An expert'))} claimed task {ev.get('node')}.")
     elif t == "concurrency_batch":
         nodes = list(ev.get("nodes") or [])
-        progress(f"⚡ Running {len(nodes)} independent tasks in parallel.")
+        activity(f"⚡ Running {len(nodes)} independent tasks in parallel: {', '.join(map(str, nodes))}.")
     elif t == "memory_read":
         activity(f"🧠 {str(ev.get('specialist', 'expert'))} recalled its memory from past runs.")
     elif t == "memory_reflect":
-        progress(f"🧠 {str(ev.get('specialist', 'An expert'))} updated its lessons from this run.")
+        activity(f"🧠 {str(ev.get('specialist', 'An expert'))} updated its lessons from this run.")
     elif t == "step_failure":
         # A step exhausted its retries; the LLM proposed alternative approaches to pick from.
         n_alt = len(ev.get("alternatives") or [])
@@ -14330,10 +14737,14 @@ def _planned_provenance_lines(step: dict[str, Any]) -> list[str]:
 
 def _readable_plan_steps(steps: list[dict[str, Any]], agenda: list[str]) -> str:
     """Export every approved assignment, including explicit legacy/unknown identities."""
+    from ..agents.plan_datasets import describe as _dataset_words
+
     lines: list[str] = []
     for index, text in enumerate(agenda):
         step = steps[index] if index < len(steps) else {}
         lines.append(f"{index + 1}. {text}")
+        if isinstance(step, dict) and step.get("dataset"):
+            lines.append(f"   - Reads: {_dataset_words(step['dataset'])}")
         lines.extend(f"   - {line}" for line in _planned_provenance_lines(step))
     return "\n".join(lines) + "\n"
 
@@ -14707,7 +15118,14 @@ def _decision_review(conn: Any, emit: "Callable[..., Any]", node: Any,
     conn.plan_value = None
     conn.plan_event.clear()
     conn.pending_plan = {"kind": "decision", "payload": {"goal": goal, "options": options}}
-    conn.push({"type": "decision_prompt", "goal": goal, "options": options})
+    # The card, and its closing below, go to the chat of the run whose prompt this is: the run that
+    # ``pending_plan`` / ``plan_event`` name, so a close can never reach another chat's card.
+    waiting = getattr(conn, "active_run", None)
+
+    def own(payload: dict) -> dict:
+        return waiting.tag(payload) if waiting is not None and hasattr(waiting, "tag") else payload
+
+    conn.push(own({"type": "decision_prompt", "goal": goal, "options": options}))
     emit("step", "lab",
          "A step outside your plan was proposed — it runs only if you approve it."
          if proposal else f"Decision point — {goal[:80]} (pick an option or type your own).")
@@ -14716,8 +15134,11 @@ def _decision_review(conn: Any, emit: "Callable[..., Any]", node: Any,
         if mon is not None:
             mon.decision("timeout")
         conn.pending_plan = None
+        # The card is closed either way: the run no longer waits for it. Left on screen, its
+        # options stayed clickable for nothing, and the page drew it again whenever its chat was
+        # opened.
+        conn.push(own({"type": "plan_done"}))
         if proposal:
-            conn.push({"type": "plan_done"})
             emit("info", "lab", f"No reply in {int(timeout / 60)} min — the proposed step was "
                                 "NOT added.")
             return {"action": "proceed", "timed_out": True}
@@ -15265,9 +15686,14 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
                    prior: "dict | None" = None,
                    saved_state: "dict | None" = None,
                    saved_decision: "dict | None" = None,
-                   replan_stale_plan: bool = False) -> bool:
+                   replan_stale_plan: bool = False,
+                   chosen_inputs: "dict | None" = None) -> bool:
     """Returns True only when ``replan_stale_plan`` is set and the earlier plan could not be
-    resumed (``requires_replan``): nothing ran, no error was shown, and the caller plans anew."""
+    resumed (``requires_replan``): nothing ran, no error was shown, and the caller plans anew.
+
+    ``chosen_inputs``: approving a saved plan whose steps chose datasets during the review
+    (``_plan_chosen_inputs``); ``req`` already binds them, and they are staged and profiled as a new
+    run's inputs are (RCHENLAB/AiScientist#120)."""
     stale_plan = False
     # This run's isolation scope — cancel + plan events keyed to THIS run, and its identity stamped on
     # every streamed WS event so the client demuxes it into the owning conversation bubble. The caller
@@ -15307,6 +15733,8 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
         from ..tools.api import render_workflow_schematic
 
         art = conn.workspace / run_id / "artifacts"
+        # process/tool_calls.jsonl: every tool call of the run with its arguments (#121).
+        tool_log = run_steps.ToolCallLog(art / "process" / "tool_calls.jsonl")
         art.mkdir(parents=True, exist_ok=True)
         if saved_state is not None and saved_state.get("resume_review"):
             resume = ResumeState.from_review_state(
@@ -15325,6 +15753,15 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
         # derived dataset_result the QC/DE tools read.
         _watch_stage(run, "data")
         decisions: dict[str, Any] = dict((saved_state or {}).get("decisions") or resume_decisions or {})
+        # The inputs are read as a new run reads them: a new run, or an approved plan that chose its
+        # datasets in review. That plan's earlier inputs are read again with the chosen ones.
+        rebinding = chosen_inputs is not None and saved_state is not None and resume is None
+        fresh_inputs = resume is None and (saved_state is None or rebinding)
+        if rebinding:
+            for key in _STAGED_INPUT_KEYS:
+                decisions.pop(key, None)
+            say_key("📎 Attached to this chat for the approved plan: " + "; ".join(chosen_inputs["attached"])
+                    + (f" (main dataset: {chosen_inputs['primary']})" if chosen_inputs.get("primary") else ""))
         # The attached case note (see LabRequest.case_note): map_phenotype_to_hpo reads it from here
         # when the model doesn't pass `text` itself. A resume keeps the note it already had.
         note = _clean_case_note(req.case_note)
@@ -15342,7 +15779,7 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
         # the PRIMARY) is byte-for-byte today's behaviour. The SECONDARY files are staged after.
         bound = _select_bound_datasets(req)
         shared_resolved = getattr(req, "_shared_resolved", None) or []
-        if shared_resolved and resume is None and saved_state is None:
+        if shared_resolved and fresh_inputs:
             # Which member file of each shared version the run reads is settled here, before anything
             # is staged or read (issue 114); the plan card shows it and a resume keeps it.
             shared_resolved = await _choose_shared_members(conn, req, shared_resolved, decisions, prior, say_key)
@@ -15360,10 +15797,12 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
         # (the follow-up router compares the next message's against it), and, for a run that
         # continues an earlier one, which run and the conversation's work so far.
         session_meta: dict[str, Any] = dict((saved_state or {}).get("session_meta") or {})
-        if resume is None and saved_state is None:
+        if fresh_inputs:
             session_meta["bound_primary"] = ((prior or {}).get("bound_primary")
                                              or (bound[0]["path"] if bound else ""))
-        if resume is None and saved_state is None and bound:
+        if rebinding:
+            session_meta["continues_from_dataset"] = False
+        if fresh_inputs and bound:
             chat_paths = [d["path"] for d in bound]
             # A dataset moved from HPC3 to this host is read from here, whatever path the chat
             # still holds for it.
@@ -15398,7 +15837,7 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
             prior = session_meta.get("prior") or None
             continues_from_dataset = bool(session_meta.get("continues_from_dataset"))
             run.continues = str((prior or {}).get("run_id") or "") or None
-        if resume is None and saved_state is None:
+        if fresh_inputs:
             # What the run reads, by UUID (its result's provenance), and what the owners' reviewed
             # Croissant metadata says about it (the planner's dataset notes).
             decisions["metadata_inputs"] = await asyncio.to_thread(
@@ -15417,11 +15856,11 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
         # The bound datasets this run cannot use, and why: the planner says so instead of planning
         # around them in silence (RCHENLAB/AiScientist issue 22).
         unusable: list[dict] = []
-        if resume is None and saved_state is None and bound:
+        if fresh_inputs and bound:
             bound, server_mirrors = await _admit_bound_paths(
                 conn, bound, say_key, emit, unusable, _shared_by_path(getattr(req, "_shared_resolved", None)))
             decisions["input_name"] = _display_name(bound[0]) if bound else ""
-        if resume is None and saved_state is None and _AUTH_ENABLED and conn.app_user_id:
+        if fresh_inputs and _AUTH_ENABLED and conn.app_user_id:
             try:
                 await asyncio.to_thread(auth_routes.record_run_datasets,
                                         conn.app_user_id, run_id, bound, shared_resolved)
@@ -15431,7 +15870,7 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
         primary_name = _display_name(bound[0]) if bound else ""
         # The primary's matrix as staged here from dfs3b, so describing its folder reads that copy.
         staged_matrices: dict[str, str] = {}
-        if saved_state is not None:
+        if saved_state is not None and not fresh_inputs:
             await _restage_server_data(conn, decisions, say_key, emit)
         elif resume is not None:
             # Resume: reuse the prior run's decisions (dataset_path / hpc_primary / datasets already
@@ -15538,7 +15977,7 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
         # so a local readable copy exists for the tools and the dfs3b path is remembered for on-HPC
         # steps, and record the whole set in decisions["datasets"]. On a resume this is already restored
         # in resume_decisions — do not re-stage.
-        if resume is None and saved_state is None and bound:
+        if fresh_inputs and bound:
             records: list[dict] = [_primary_dataset_record(bound[0], decisions)]
             for entry in bound[1:]:
                 try:
@@ -15584,7 +16023,7 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
                         say_key(f"⚠ {folder['name']}/ holds no Cell Ranger library, so CellQC "
                                 "will not QC it", "warning")
                 _folder_gists(records, folders, layout)
-        if resume is None and saved_state is None and unusable:
+        if fresh_inputs and unusable:
             decisions["unusable_inputs"] = unusable
 
         _llm = _lab_llm(conn)
@@ -15608,7 +16047,7 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
         # since connect; no extra provisioning). Records each file's "what is this" and sets
         # the primary's content modality so pipeline routing (Phase B) uses CONTENT, not the extension.
         # Skipped on a resume (routing guidance is already restored). Best-effort — never fails the run.
-        if resume is None and saved_state is None and decisions.get("datasets"):
+        if fresh_inputs and decisions.get("datasets"):
             try:
                 gists = await asyncio.to_thread(_triage_bound_datasets, conn, decisions, model)
                 for g in gists:
@@ -15834,8 +16273,10 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
         # import, so induced skills survive a restart and are shared. Otherwise fall back to this
         # connection's workspace: still usable by later runs in THIS process (register_skill), but
         # gone on restart. Env opt-in either way.
+        # Induction learns from accepted run_code, so it is off with model-written code (#150).
+        from ..agents.code_policy import model_written_code
         skill_induction = (os.environ.get("AISCIENTIST_SKILL_INDUCTION", "").strip().lower()
-                           in ("1", "true", "yes"))
+                           in ("1", "true", "yes")) and model_written_code()
         # Run-scope context management: measure the carried findings block against the served window
         # and compact it before it crowds out the work. Off = today's behaviour.
         context_management = (os.environ.get("AISCIENTIST_CONTEXT_MANAGEMENT", "").strip().lower()
@@ -15875,6 +16316,9 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
                                              plan_yaml=plan_yaml,
                                              context_management=context_management),
                               complete_fn=complete_fn, scientist=scientist)
+        # The datasets this account can use, for a reply that asks the planner to look them up and
+        # for checking a step's dataset (RCHENLAB/AiScientist#120).
+        lab_obj.dataset_catalog = lambda: _plan_dataset_catalogue(conn)
         if saved_state is not None:
             from dataclasses import fields, replace
             # Only the fields this code has: a plan saved before a deploy that drops one still runs.
@@ -15954,9 +16398,22 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
             # progress), in addition to the full technical feed on the right.
             if run.monitor is not None:
                 run.monitor.observe(ev)
+            if ev.get("type") == "steps_unavailable":
+                # A plan step no tested tool or skill does (#150): recorded for the team now, before
+                # the card says so, and listed on the plan card.
+                ev = {**ev, "recorded": _record_unavailable(conn, run_id, req, lab_obj, decisions,
+                                                            session_meta)}
+                run_flags["not_available_recorded"] = ev["recorded"]
             t_ev = ev.get("type")
             _note_usage_step(ev, run_flags)
+            # Every tool call, with its arguments, into the run's results (the chat says it in words).
+            tool_log.observe(ev, step=" ".join(str(_USAGE_STEP.get() or "").split())[:160])
+            if t_ev == "report_step":
+                run_flags["report_steps"] = [str(x) for x in (ev.get("steps") or [])]
             for payload in _lab_event_to_chat(ev):
+                if payload.get("type") == "run_command":
+                    # The step this thread works on, so steps that run side by side keep apart.
+                    payload["step_key"] = _RUN_STEP.get() or ""
                 conn.push(payload)
                 # ...and into the EXPORTED log. The reasoning narrative — design meeting, expert
                 # turns, hypotheses formed and adjudicated, plan pruning — used to reach the live
@@ -15975,7 +16432,7 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
             elif t == "scientist_start":
                 emit("step", "lab", f"{ev.get('specialist', 'Scientist')}: {ev['step']}")
             elif t == "tool_start":
-                emit("info", "lab", f"  -> {ev['tool']}({json.dumps(ev.get('args', {}))[:80]})")
+                emit("info", "lab", f"  -> {run_steps.tool_call_words(ev['tool'], ev.get('args'))}")
             elif t == "tool_result":
                 emit("info", "lab", f"  = {ev['tool']}: {ev['summary']}")
             elif t == "tool_error":
@@ -16082,6 +16539,10 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
             prompt = {**_plan_dataset_inputs(decisions, primary_name),
                       "revised": list(run_flags["plan_revised"]),
                       "problems": list(run_flags["plan_problems"]),
+                      # The steps held as not available, this card's and the saved plan's (#150).
+                      **({"not_available": _not_available_lines(
+                          held, run_flags.get("not_available_recorded") or _skill_request_saved(run_id))}
+                         if (held := list(getattr(lab_obj, "unavailable_steps", None) or [])) else {}),
                       **(run_flags.get("plan_answer") or {}),
                       "estimate": plan_estimate(agenda) if agenda else None,
                       **({"step_outputs": step_outputs} if step_outputs else {})}
@@ -16139,6 +16600,7 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
                                 approved_plan_yaml=lab_obj.approved_plan_yaml)
             session_meta.pop("resume_review", None)
             session_meta["step_provenance"] = getattr(lab_obj, "step_provenance", lambda: [])()
+            session_meta["step_states"] = run.step_states()
             _write_run_state(art, partial, lab_obj.guidance, decisions,
                              lab_obj.execution_profile, extra=session_meta)
             _remember_planned_run(conn, run)
@@ -16178,6 +16640,7 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
         # cancelled in review lists every step as skipped, and is finished below with no record.
         step_usage = getattr(lab_obj, "step_provenance", lambda: [])()
         session_meta["step_provenance"] = step_usage
+        session_meta["step_states"] = run.step_states()
         steps_ran = any(row.get("status") != "skipped" for row in step_usage)
         if steps_ran:
             try:
@@ -16203,6 +16666,26 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
                                  self_sourced=getattr(lab_obj, "self_sourced", ""), extra=session_meta)
             reason = (result.final_answer or "").strip() or \
                 "The plan review ended before anything ran — no analysis steps were executed."
+            unavailable = list(getattr(result, "unavailable_steps", None) or [])
+            if unavailable and not result.agenda and not run_flags["plan_cancelled"]:
+                # No step of the plan has a tested tool or skill (#150): nothing ran, no job was
+                # submitted. The reply is the plan card's lines; the run is a skill request.
+                from ..agents.code_policy import not_available_markdown
+                rec = None
+                try:
+                    rec = _save_skill_request(conn, run_id, req, result, lab_obj, decisions,
+                                              session_meta, {})
+                except Exception as exc:  # noqa: BLE001 - a record, never a reason to lose the reply
+                    print(f"[skill_requests] not recorded: {type(exc).__name__}: {exc}")
+                reason = not_available_markdown(unavailable, recorded=rec is not None).strip()
+                say_key("🚫 Not available — no tested tool or skill does what this request asks, so "
+                        "nothing ran.", "warning")
+                conn.push({"type": "chat_token", "token": reason})
+                conn.push({"type": "chat_stopped"})
+                _finish_run_record(conn, run_id, "done", None, reason)
+                if rec is not None:
+                    await asyncio.to_thread(_summarize_skill_request, rec, complete_fn, lab_obj)
+                return
             # One event, one sentence — the three end-of-run lines used to disagree with each
             # other AND with what had happened (report v2_5, C-3).
             say_key("🛑 Plan review timed out (nobody cancelled) — nothing was executed, "
@@ -16291,17 +16774,22 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
         # the reply and the reports open with a notice naming the untested ones, their code is kept
         # in process/untested_code.md, and the run becomes a skill request for the team. Labels and
         # records only: none of it may cost the run its report.
-        untested_md, skill_request = "", None
+        untested_md, unavailable_md, skill_request = "", "", None
         try:
+            from ..agents.code_policy import not_available_markdown
             from ..agents.code_provenance import has_untested_code, run_provenance, untested_notice
             provenance = run_provenance(result.rounds)
+            unavailable = list(getattr(result, "unavailable_steps", None) or [])
             if has_untested_code(provenance):
                 (art / "process").mkdir(parents=True, exist_ok=True)
                 (art / "process" / "untested_code.md").write_text(
                     _untested_code_md(provenance), encoding="utf-8")
+            if has_untested_code(provenance) or unavailable:
                 skill_request = _save_skill_request(conn, run_id, req, result, lab_obj, decisions,
                                                     session_meta, provenance)
             untested_md = untested_notice(provenance, recorded=skill_request is not None)
+            # The steps that did not run because no tested tool or skill does them (#150).
+            unavailable_md = not_available_markdown(unavailable, recorded=skill_request is not None)
             if untested_md:
                 n = len(provenance["untested_accepted"])
                 emit("warning", "lab", f"🧪 {n} completed step(s) ran code written during this run, "
@@ -16370,6 +16858,11 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
         vl_attempted = False   # did the post-render visual review get a document to read?
         # The lab is done; what is left is the write-up (or, for QC only, the chat reply).
         _watch_stage(run, "writeup" if report_wanted else "report")
+        # The plan's write_report step is the write-up: its mark on the plan cards follows it (#121).
+        mark_step = getattr(lab_obj, "mark_step", None)
+        report_texts = list(run_flags.get("report_steps") or []) if report_wanted and mark_step else []
+        for text in report_texts:
+            mark_step(on_event, text, "processing")
         if chat_only:
             # Quality control is all this run did: the answer is a short reply in the chat, written
             # by code from the QC tool's own numbers. No report, no PDF/DOCX, no References and no
@@ -16419,6 +16912,8 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
                 qc_report=qc_report, abandoned=abandoned,
                 on_stage=lambda stage: _watch_stage(run, stage))
             vl_attempted = done["vl_attempted"]
+        for text in report_texts:
+            mark_step(on_event, text, "stopped" if abandoned() else "done")
 
         if qc_report:
             # The chat gets the numbers; the written report is in the folder.
@@ -16441,6 +16936,8 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
                          "Downloads panel.", "success" if not abandoned() else "warning")
         if untested_md:
             result.final_answer = untested_md + "\n" + (result.final_answer or "")
+        if unavailable_md:
+            result.final_answer = unavailable_md + "\n" + (result.final_answer or "")
         result.final_answer = _default_qc_display(result.final_answer or "", art, result,
                                                   question=req.question)
         conn.push({"type": "chat_token", "token": result.final_answer or "(no report produced)"})
@@ -16568,11 +17065,37 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
                     conn.push({"type": "run_usage", "run_id": run_id, **usage})
             except Exception as exc:  # usage reporting must not prevent run cleanup
                 print(f"[lab] compute usage unavailable: {exc}")
+        if "tool_log" in locals():
+            tool_log.close()
+        if "art" in locals():
+            # The marks of the plan's steps as the run ended them, with the run's saved state (#121).
+            _save_step_states(art, run.step_states())
         run.running = False
         # Close the run scope so a post-run WS reconnect doesn't see a stale pending plan; the run
         # stays in conn.runs so a late approve/cancel that names it resolves to a no-op.
         conn.end_run(run)
     return stale_plan
+
+
+def _save_step_states(art: Path, states: "list[dict[str, Any]]") -> None:
+    """Write where each step of the plan ended into the run's saved state
+    (``process/run_state.json`` ``step_states``), which is written before the write-up runs: the
+    report step's mark and a step a Stop ended are only known later. Best-effort, and only into a
+    state file the run already has."""
+    if not states:
+        return
+    path = art / "process" / "run_state.json"
+    try:
+        if not path.is_file():
+            return
+        state = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(state, dict):
+            return
+        state["step_states"] = states
+        from .saved_plans import _write
+        _write(path, json.dumps(state, default=str, indent=2))
+    except (OSError, ValueError) as exc:
+        print(f"[lab] step states not saved: {type(exc).__name__}: {exc}")
 
 
 
@@ -17577,7 +18100,8 @@ def _default_qc_display(text: str, art: Path, result: Any = None, *, question: s
     backmatter = _BACKMATTER_HEADINGS.search(text)
     text, back = (text[:backmatter.start()], text[backmatter.start():]) if backmatter else (text, "")
     qc = _qc_step_outcome(result) if result is not None else None
-    libs = [lib for lib in (qc["result"].get("libraries") or [] if qc else []) if isinstance(lib, dict)]
+    libs = [lib for lib in (_qc_complete_result(art, qc["result"]).get("libraries") or [] if qc else [])
+            if isinstance(lib, dict)]
     counts = [f"{lib.get('sample') or 'Library'}: {line}"
               for lib in libs for line in _brief_doublet_lines(lib)]
     standalone_counts = _standalone_doublet_lines(result)
@@ -17632,7 +18156,7 @@ def _brief_qc_lines(qc: "dict[str, Any] | None", art: Path) -> "list[str]":
     ``qc`` is :func:`_qc_step_outcome`'s."""
     if qc is None:
         return []
-    tool, r = qc["tool"], qc["result"]
+    tool, r = qc["tool"], _qc_complete_result(art, qc["result"])
     lines = ["## Quality control", ""]
     ending = _qc_ending_text(qc)
     if ending:
@@ -17932,6 +18456,92 @@ _QC_REASONS = (("max_pct_mt", lambda v: f"mitochondrial RNA above {v:g}%", "too 
                ("min_counts", lambda v: f"fewer than {v:g} counts", "too few counts"))
 
 
+def _qc_filter_text(lib: dict, th: dict) -> str:
+    """What the count, gene and mitochondrial filters removed from one library, as the reply says it
+    ("Filters removed 670: 541 only for mitochondrial RNA above 10%, …."); '' when unknown."""
+    removed = lib.get("removed_only_by") or {}
+    why = sorted(((int(removed[key]), (words(th[key]) if isinstance(th.get(key), (int, float)) else plain))
+                  for key, words, plain in _QC_REASONS
+                  if isinstance(removed.get(key), (int, float)) and removed[key]),
+                 reverse=True)
+    several = removed.get("several_thresholds")
+    if not why and not isinstance(several, (int, float)):
+        return ""
+    parts = [f"{k:,} only for {w}" for k, w in why]
+    if isinstance(several, (int, float)) and several:
+        parts.append(f"{int(several):,} for more than one")
+    cr, filt = lib.get("cells_cellranger"), lib.get("cells_after_filter")
+    gone = (f" {int(cr) - int(filt):,}" if isinstance(cr, (int, float))
+            and isinstance(filt, (int, float)) else "")
+    return f"Filters removed{gone}: " + ", ".join(parts) + "."
+
+
+def _by_library(warnings: "list[str]", samples: "list[str]") -> "list[str]":
+    """The warnings in library order: the run's own first, then each library's (a CellQC warning
+    names its library first, "Sample3: max_pct_mt=10.0% alone removed …"), so a library's warnings
+    read together under the table."""
+    def owner(w: str) -> int:
+        for i, s in enumerate(samples):
+            if s and (w.startswith(s + ":") or w.startswith(s + " ")):
+                return i + 1
+        return 0
+    return sorted(warnings, key=owner)
+
+
+# What a QC reply reads from the complete result when the step holds only its bounded preview.
+_QC_FULL_FIELDS = ("libraries", "warnings", "notes", "thresholds", "threshold_defaults", "ambient",
+                   "checkpoints", "excluded_libraries")
+
+
+def _qc_complete_result(art: "Path | None", r: dict) -> dict:
+    """``r`` with what its bounded preview left out, from the complete result of the same call.
+
+    A large MCP response reaches the step as a preview of a few KB (``mcp_result_summary``, and the
+    adapter's compaction): run 1692dc47adc7's CellQC result over three libraries kept its totals
+    and lost its per-library rows and its warnings, so the reply was one total line. The complete
+    result is the nested ``result`` when it is whole, else the file ``full_result`` names in the
+    run's folder (``extra/`` once the bundle is tidied). A candidate is used only when it is the same
+    call's result: the same cell totals, and the same analysis and task where both name them."""
+    if not isinstance(r, dict):
+        return r
+    rows = [lib for lib in (r.get("libraries") or []) if isinstance(lib, dict)]
+    summary = r.get("response_summary") if isinstance(r.get("response_summary"), dict) else {}
+    n = r.get("n_libraries")
+    if not (summary.get("complete") is False or r.get("response_omitted") or r.get("response_compacted")
+            or (isinstance(n, int) and len(rows) < n)):
+        return r
+
+    def same(full: Any) -> bool:
+        if not isinstance(full, dict) or full is r:
+            return False
+        keys = [k for k in ("cells_before", "cells_after") if r.get(k) is not None]
+        return bool(keys) and all(full.get(k) == r.get(k) for k in keys) and all(
+            full.get(k) == r.get(k) for k in ("analysis_id", "task_id")
+            if full.get(k) is not None and r.get(k) is not None)
+
+    def whole(full: dict) -> bool:
+        part = full.get("response_summary")
+        return not (isinstance(part, dict) and part.get("complete") is False) and not full.get("response_omitted")
+
+    nested = r.get("result") if isinstance(r.get("result"), dict) else None
+    candidates: "list[Any]" = [nested] if nested is not None and whole(nested) else []
+    rel = r.get("full_result") or (nested or {}).get("full_result")
+    if art is not None and isinstance(rel, str) and rel.startswith("mcp/") and ".." not in rel.split("/"):
+        for prefix in ("", "extra/"):
+            path = Path(art) / (prefix + rel)
+            try:
+                if (path.resolve().is_relative_to(Path(art).resolve()) and path.is_file()
+                        and path.stat().st_size <= 32 * 1024 * 1024):
+                    candidates.append(json.loads(path.read_text(encoding="utf-8")))
+                    break
+            except (OSError, ValueError):
+                continue
+    for full in candidates:
+        if same(full) and len([x for x in full.get("libraries") or [] if isinstance(x, dict)]) >= len(rows):
+            return {**r, **{k: full[k] for k in _QC_FULL_FIELDS if k in full}}
+    return r
+
+
 def _qc_chat_reply(art: Path, result: Any) -> str:
     """The whole answer to a run that only did quality control: a few lines for the chat, every
     number from the QC tool's return value or CellQC's metrics table, none written by a model.
@@ -17947,7 +18557,7 @@ def _qc_chat_reply(art: Path, result: Any) -> str:
     outcome = _qc_step_outcome(result)
     if outcome is None:
         return ""
-    tool, r = outcome["tool"], outcome["result"]
+    tool, r = outcome["tool"], _qc_complete_result(art, outcome["result"])
     headline = _QC_HEADLINES[outcome["status"]]
     ending = _qc_ending_text(outcome)
     left_out = _qc_bound_not_qcd(art, r)
@@ -17958,6 +18568,8 @@ def _qc_chat_reply(art: Path, result: Any) -> str:
 
     libs = [lib for lib in (r.get("libraries") or []) if isinstance(lib, dict)]
     warnings = _brief_qc_warnings(r)
+    if len(libs) > 1:
+        warnings = _by_library(warnings, [str(lib.get("sample") or "") for lib in libs])
     before, after = r.get("cells_before"), r.get("cells_after")
     genes = (f"; {int(r['genes_after']):,} genes" if len(r.get("checkpoints") or {}) < 2
              and isinstance(r.get("genes_after"), (int, float))
@@ -17974,21 +18586,9 @@ def _qc_chat_reply(art: Path, result: Any) -> str:
         lines.append(f"- **Bound but not QC'd:** {', '.join(left_out)}.")
     if len(libs) == 1:
         lib = libs[0]
-        removed = lib.get("removed_only_by") or {}
-        why = sorted(((int(removed[key]), (words(th[key]) if isinstance(th.get(key), (int, float))
-                                            else plain))
-                      for key, words, plain in _QC_REASONS
-                      if isinstance(removed.get(key), (int, float)) and removed[key]),
-                     reverse=True)
-        cr, filt = lib.get("cells_cellranger"), lib.get("cells_after_filter")
-        if why or isinstance(removed.get("several_thresholds"), (int, float)):
-            several = removed.get("several_thresholds")
-            parts = [f"{k:,} only for {w}" for k, w in why]
-            if isinstance(several, (int, float)) and several:
-                parts.append(f"{int(several):,} for more than one")
-            gone = (f" {int(cr) - int(filt):,}" if isinstance(cr, (int, float))
-                    and isinstance(filt, (int, float)) else "")
-            lines.append(f"- Filters removed{gone}: " + ", ".join(parts) + ".")
+        filters = _qc_filter_text(lib, th)
+        if filters:
+            lines.append(f"- {filters}")
         dbl = _brief_doublet_lines(lib)
         if dbl:
             lines.append("- " + " ".join(dbl))
@@ -18009,19 +18609,31 @@ def _qc_chat_reply(art: Path, result: Any) -> str:
             text = "; ".join(bits)
             lines.append("- " + text[:1].upper() + text[1:] + ".")
     elif libs:
+        # One row per library, so a library that went differently is seen (run 1692dc47adc7's reply
+        # over three libraries was one total line). The species column only when they differ.
         mito_kept = all(isinstance(lib.get("median_pct_mt_kept"), (int, float)) for lib in libs)
         mkey = "median_pct_mt_kept" if mito_kept else "median_pct_mt"
-        lines += ["", "| Library | Cell Ranger cells | after filters | after doublets | doublets removed | kept | "
+        species = len({str(lib.get("species") or "") for lib in libs}) > 1
+        lines += ["", "| Library | " + ("Species | " if species else "")
+                      + "Cell Ranger cells | after filters | after doublets | doublets removed | kept | "
                       + ("median % mito (kept)" if mito_kept else "median % mito (before filtering)")
-                      + " |", "|---|---:|---:|---:|---:|---:|---:|"]
+                      + " | ambient RNA |", "|---|" + ("---|" if species else "") + "---:|---:|---:|---:|---:|---:|---:|"]
         for lib in libs:
             kept, mito = lib.get("frac_retained"), lib.get(mkey)
-            lines.append(f"| {lib.get('sample', '—')} | {n(lib.get('cells_cellranger'))} | "
+            amb = lib.get("ambient_soupx_contamination_mean")
+            lines.append(f"| {lib.get('sample', '—')} | "
+                         + (f"{lib.get('species') or '—'} | " if species else "")
+                         + f"{n(lib.get('cells_cellranger'))} | "
                          f"{n(lib.get('cells_after_filter'))} | {n(lib.get('cells_after_doublets'))} | "
                          f"{n(lib.get('doublets_removed'))} | "
                          f"{f'{100 * kept:.1f}%' if isinstance(kept, (int, float)) else '—'} | "
-                         f"{f'{mito:.2f}' if isinstance(mito, (int, float)) else '—'} |")
+                         f"{f'{mito:.2f}' if isinstance(mito, (int, float)) else '—'} | "
+                         f"{f'{100 * amb:.1f}%' if isinstance(amb, (int, float)) else '—'} |")
         lines.append("")
+        for lib in libs:
+            filters = _qc_filter_text(lib, th)
+            if filters:
+                lines.append(f"- {lib.get('sample', 'Library')} — {filters[:1].lower()}{filters[1:]}")
     if th and len(libs) != 1:   # one library's filter line already names each threshold
         lines.append("- Thresholds: " + ", ".join(f"`{k}` = {v}" for k, v in th.items()) + ".")
     if th:
@@ -18775,7 +19387,11 @@ def _untested_code_md(provenance: dict) -> str:
 
 def _save_skill_request(conn: "Connection", run_id: str, req: Any, result: Any, lab_obj: Any,
                         decisions: dict, session_meta: dict, provenance: dict) -> "dict | None":
-    """The run as a skill request (gateway/skill_requests.py), saved before the reply says so."""
+    """The run as a skill request (gateway/skill_requests.py), saved before the reply says so.
+
+    With it go the plan steps that did not run because no tested tool or skill does them (#150). A
+    record saved earlier in the same run (when the plan first held such a step) is updated: its
+    status, its history and when it was made are kept."""
     from . import skill_requests
     if not skill_requests.enabled():
         return None
@@ -18791,10 +19407,53 @@ def _save_skill_request(conn: "Connection", run_id: str, req: Any, result: Any, 
                           if isinstance(e, dict)],
         datasets=datasets, pipelines=[str(p.get("key")) for p in lab_obj.protocols],
         skills=_skill_request_skills(lab_obj, provenance),
-        converged=bool(result.converged), claim_audit=getattr(result, "claim_audit", None),
-        induced_skills=list(getattr(lab_obj, "induced_skills", None) or []))
+        converged=bool(getattr(result, "converged", False)),
+        claim_audit=getattr(result, "claim_audit", None),
+        induced_skills=list(getattr(lab_obj, "induced_skills", None) or []),
+        not_available=list(getattr(lab_obj, "unavailable_steps", None) or []))
+    earlier = skill_requests.load(rec["id"])
+    if earlier:
+        rec.update({k: earlier[k] for k in ("created_at", "status", "status_history") if k in earlier})
+    if not earlier or not earlier.get("summary"):
+        rec["summary"], rec["summary_by"] = skill_requests.fallback_summary(rec), "code"
+    else:
+        rec["summary"], rec["summary_by"] = earlier["summary"], earlier.get("summary_by", "")
     skill_requests.save(rec)
     return rec
+
+
+def _record_unavailable(conn: "Connection", run_id: str, req: Any, lab_obj: Any,
+                        decisions: dict, session_meta: dict) -> bool:
+    """Record the run as a skill request when its plan holds a step no tested tool or skill does
+    (#150), as soon as it does, with the steps the current plan holds; a redraft that holds none
+    takes the record back (``skill_requests.withdraw``). True when it is recorded. Never stops the
+    plan."""
+    try:
+        if not list(getattr(lab_obj, "unavailable_steps", None) or []):
+            from . import skill_requests
+            if skill_requests.enabled():
+                skill_requests.withdraw(run_id)
+            return False
+        return _save_skill_request(conn, run_id, req, None, lab_obj, decisions, session_meta,
+                                   {}) is not None
+    except Exception as exc:  # noqa: BLE001 - a record, never a reason to lose the plan
+        print(f"[skill_requests] not-available steps not recorded: {type(exc).__name__}: {exc}")
+        return False
+
+
+def _skill_request_saved(run_id: str) -> bool:
+    """Is this run already recorded as a skill request?"""
+    from . import skill_requests
+    try:
+        return skill_requests.enabled() and skill_requests.load(run_id) is not None
+    except Exception:  # noqa: BLE001 - a label, never a reason to lose the card
+        return False
+
+
+def _not_available_lines(rows: "list[dict]", recorded: bool) -> "list[str]":
+    """The plan card's lines for the steps that do not run (#150's wording, in Markdown)."""
+    from ..agents.code_policy import NotAvailable
+    return [NotAvailable.from_dict(r).line(recorded=recorded) for r in rows if isinstance(r, dict)][:12]
 
 
 def _skill_request_skills(lab_obj: Any, provenance: dict) -> "list[str]":

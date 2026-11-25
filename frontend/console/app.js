@@ -630,10 +630,14 @@ function msgFromServer(m) {
   // reviewable after a reload / on another device — not only in a downloaded log.
   const meta = m.meta || {};
   if (meta.stream_id) msg.streamId = meta.stream_id;
-  if (meta.thinking || (meta.feed && meta.feed.length) || (meta.jobs && meta.jobs.length)) {
+  if (meta.thinking || (meta.feed && meta.feed.length) || (meta.jobs && meta.jobs.length) || (meta.steps && meta.steps.length)) {
     msg.thinking = meta.thinking || "";
     msg.feed = meta.feed || [];
     if (Array.isArray(meta.jobs)) msg.jobs = meta.jobs;
+    if (Array.isArray(meta.steps) && meta.steps.length) {   // the plan's step marks (#121), and their run
+      msg.steps = meta.steps;
+      if (meta.steps_run) msg.stepsRun = meta.steps_run;
+    }
     if (meta.outcome) msg.outcome = meta.outcome;
     if (meta.ms != null) msg.ms = meta.ms;
   }
@@ -651,10 +655,14 @@ function serverMsgPayload(msg) {
   const payload = { role: msg.role, content: msg.content || "" };
   // A message's images go by id; the server keeps the references it checks (name, type, size, url).
   if (Array.isArray(msg.images) && msg.images.length) { payload.kind = "text"; payload.meta = { images: msg.images.map((i) => ({ id: i.id })) }; }
-  if (msg.thinking || (msg.feed && msg.feed.length) || (msg.jobs && msg.jobs.length)) {
+  if (msg.thinking || (msg.feed && msg.feed.length) || (msg.jobs && msg.jobs.length) || (msg.steps && msg.steps.length)) {
     payload.kind = "text";
     payload.meta = { ...(payload.meta || {}), thinking: msg.thinking || "", feed: msg.feed || [] };
     if (Array.isArray(msg.jobs)) payload.meta.jobs = msg.jobs;
+    if (Array.isArray(msg.steps) && msg.steps.length) {
+      payload.meta.steps = msg.steps;
+      if (msg.stepsRun) payload.meta.steps_run = msg.stepsRun;
+    }
     if (msg.outcome) payload.meta.outcome = msg.outcome;
     if (msg.ms != null) payload.meta.ms = msg.ms;
   }
@@ -1314,11 +1322,11 @@ function refreshDownloads() {
 
 function messageEl(m) {
   if (m.kind === "plan" && m.plan) {
-    // An approved plan: its entry, which opens the whole plan in the side panel.
+    // An approved plan: its entry, which opens the whole plan in the side panel, with where each of
+    // its steps stands once it runs (#121).
     const el = document.createElement("div");
     el.className = "msg assistant plan-card plan-sheet plan-entry saved";
-    el.innerHTML = planEntryHtml(m.plan.agenda || [], m.plan.doc || null, { status: m.plan.status || "Approved" });
-    el.querySelector('[data-plan="open"]').addEventListener("click", () => { state.planView = m.plan; openPlanPanel(); renderPlanPanel(); });
+    drawSavedPlanEntry(el, m);
     return el;
   }
   if (m.kind === "artifacts") {
@@ -1355,6 +1363,30 @@ function messageEl(m) {
   // persisted message at chat_done (finishAssistantStream -> renderChat), which is where it lands.
   renderMermaidIn(el);
   return el;
+}
+
+// An approved plan's entry in the chat, drawn again whenever one of its steps changes state.
+function drawSavedPlanEntry(el, m) {
+  el._planMsg = m;
+  const states = planStatesFor(activeSession(), m, activeChat());
+  el.innerHTML = planEntryHtml(m.plan.agenda || [], m.plan.doc || null, { status: m.plan.status || "Approved", states });
+  el._planMarks = JSON.stringify(states || null);
+  el.querySelector('[data-plan="open"]').addEventListener("click", () => {
+    state.planView = m.plan; state.planViewMsg = m; openPlanPanel(); renderPlanPanel();
+  });
+}
+
+// A step of the chat's run changed state: mark it on the chat's plan entry and on the side panel.
+function refreshPlanStates(c) {
+  if (!chatVisible(c)) return;
+  for (const el of $("chatStream").querySelectorAll(".plan-entry.saved")) {
+    const m = el._planMsg;
+    if (!m) continue;
+    const states = planStatesFor(activeSession(), m, c);
+    if (JSON.stringify(states || null) !== el._planMarks) drawSavedPlanEntry(el, m);
+  }
+  const view = chatPlanView(c);
+  if (view && view.mode === "saved") renderPlanPanel();
 }
 
 // HTML for one persisted feed entry — a key-progress line or a collapsed step-code block.
@@ -1447,6 +1479,19 @@ function runStepText(o) {
   return (o.total ? `Step ${Math.min(o.n, o.total)} of ${o.total}` : `Step ${o.n}`) + ` · ${o.step}`;
 }
 
+// The steps running now, from their records (#121): "Step 2 of 5 · QC", or for two side by side
+// "Steps 2, 3 of 5 · QC, Markers". "" when no step record says processing.
+function runStepsTitle(records, total) {
+  const now = (records || []).filter((r) => r && r.state === "processing");
+  if (!now.length) return "";
+  const nums = now.map((r) => (Number.isInteger(r.step) ? String(r.step) : "")).filter(Boolean);
+  const titles = now.map((r) => stepFlat(r.title || planStepParts(r.text || "").title).replace(/[*`]/g, ""));
+  const of = total ? ` of ${total}` : "";
+  const head = !nums.length ? (now.length === 1 ? "Added step" : `${now.length} steps`)
+    : nums.length === 1 ? `Step ${nums[0]}${of}` : `Steps ${nums.join(", ")}${of}`;
+  return `${head} · ${titles.join(", ")}`;
+}
+
 // The Slurm chip on the line: the most active of the run's jobs. The CPU worker holds its node
 // between commands, so it is named only when no job of the run's own is running or queued.
 function runJobChip(jobs, ended) {
@@ -1481,7 +1526,7 @@ const RUN_WAIT_TITLE = {
 // a finished run), elapsedMs.
 function runCardView(feed, jobs, thinking, opts = {}) {
   const o = runOutline(feed);
-  const stepText = runStepText(o);
+  const stepText = runStepsTitle(opts.steps, o.total) || runStepText(o);
   let title;
   if (opts.live) {
     if (opts.waitingPlan) title = RUN_WAIT_TITLE[opts.waitingPlan] || RUN_WAIT_TITLE.plan;
@@ -1660,8 +1705,8 @@ function ownerVisible() { const c = activeChat(); return !!(c && c.run); }
 let runTicker = null;
 function startAssistantStream(c) {
   // A plan, clarify or decision prompt clears startedAt (holdPlanPrompt); approving it starts it again.
-  c.run = { text: "", thinking: "", feed: [], jobs: [], status: "running", statusLabel: "", startedAt: Date.now(),
-            runId: null, streamId: null, cardOpen: false };
+  c.run = { text: "", thinking: "", feed: [], jobs: [], steps: {}, commands: {}, status: "running", statusLabel: "",
+            startedAt: Date.now(), runId: null, streamId: null, cardOpen: false };
   if (chatVisible(c)) { state.streamDom = null; mountStream(); }
   // Heartbeat: keep the "Working…" timer ticking even when no events arrive for a while (long
   // HPC3 compute steps are silent), so a run never looks frozen. One ticker serves every chat.
@@ -1703,7 +1748,7 @@ function mountStream() {
     wrap = document.createElement("div");
     wrap.className = "msg assistant streaming";
     wrap.innerHTML = '<details class="run-card live"><summary class="run-sum"></summary>' +
-      '<div class="run-detail"><div class="run-sec run-jobs"></div>' +
+      '<div class="run-detail"><div class="run-sec run-now-sec" hidden></div><div class="run-sec run-jobs"></div>' +
       '<div class="run-sec run-steps" style="display:none"><div class="run-sec-head">' + icon("format_list_bulleted") +
       'Progress</div><div class="lab-progress"></div></div>' +
       '<details class="think" style="display:none">' + summaryRow("psychology", "Activity log") +
@@ -1715,6 +1760,7 @@ function mountStream() {
   state.streamDom = {
     wrap, card,
     sum: wrap.querySelector(".run-sum"),
+    now: wrap.querySelector(".run-now-sec"),
     jobs: wrap.querySelector(".run-jobs"),
     steps: wrap.querySelector(".run-steps"),
     feed: wrap.querySelector(".lab-progress"),
@@ -1727,6 +1773,17 @@ function mountStream() {
     // Open or closed is the reader's choice, kept for this run across repaints and chat switches.
     card.open = !!(c && c.run && c.run.cardOpen);
     card.addEventListener("toggle", () => { const x = activeChat(); if (x && x.run) x.run.cardOpen = card.open; });
+    // Copy a running step's command, as it is written.
+    card.addEventListener("click", (e) => {
+      const b = e.target.closest("[data-copy-cmd]");
+      if (!b) return;
+      e.preventDefault();
+      const code = b.closest(".now-step")?.querySelector(".now-code code")?.textContent || "";
+      const done = () => toast("Command copied.");
+      const failed = () => toast("Could not copy: select the command and copy it.");
+      if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(code).then(done, failed);
+      else failed();
+    });
   }
   repaintStream();
 }
@@ -1804,7 +1861,7 @@ function repaintWorking() {
   const waiting = c.planPending ? ((c.plan && c.plan.kind) || "plan") : "";
   const live = run.status === "running" && !waiting;
   const view = runCardView(run.feed, run.jobs || [], run.thinking, {
-    live: true, waitingPlan: waiting, writing: !!run.text,
+    live: true, waitingPlan: waiting, writing: !!run.text, steps: orderedSteps(run.steps),
     // A status the backend sent while the prompt waited is stale once it is answered.
     status: live ? run.statusLabel : "",
     elapsedMs: live && run.startedAt != null ? Date.now() - run.startedAt : null,
@@ -1828,6 +1885,66 @@ function repaintWorking() {
     const jobs = jobListHtml(run.jobs || [], { live: true, model: modelServerJob() });
     if (dom.jobsHtml !== jobs) { dom.jobs.innerHTML = jobs; dom.jobsHtml = jobs; }
   }
+  if (dom.now) repaintNow(dom, run, live);
+}
+
+// ---- the top of the opened run card: what runs now (#121) ----------------------------------------
+// Each step running now, its Slurm job (id, state, node, time) and the command or code the model
+// wrote for it, readable and copyable while it runs. Rewritten part by part, so the command a reader
+// is selecting is not redrawn under the pointer by the 1-second timer.
+function runNowParts(run) {
+  const cmds = run.commands || {};
+  const parts = orderedSteps(run.steps).filter((r) => r.state === "processing").map((r) => ({
+    key: r.key, rec: r, cmd: cmds[r.key] || null,
+    job: r.job_id ? (run.jobs || []).find((j) => String(j.job_id) === String(r.job_id)) || null : null,
+  }));
+  // A command no step claimed (a run without a plan, the write-up).
+  if (cmds[""] && cmds[""].state === "running") parts.push({ key: "", rec: null, cmd: cmds[""], job: null });
+  return parts;
+}
+function nowHeadHtml(p) {
+  const r = p.rec;
+  const title = r ? stepFlat(r.title || planStepParts(r.text || "").title).replace(/[*`]/g, "") : "";
+  const head = r ? (Number.isInteger(r.step) ? `Step ${r.step}` : "Added step") + (title ? ` · ${title}` : "") : "Running now";
+  return `<span class="step-spin" aria-hidden="true"></span><span class="now-title">${escapeHtml(head)}</span>`
+    + (r && r.reason ? `<span class="now-why">${escapeHtml(r.reason)}</span>` : "");
+}
+const COMMAND_STATE = { running: "running", done: "finished", failed: "failed", stopped: "stopped" };
+function nowCmdHeadHtml(cmd) {
+  if (!cmd) return `<span class="now-cmd-words">Waiting for the model's next command…</span>`;
+  const st = COMMAND_STATE[cmd.state] || cmd.state || "";
+  return `<span class="now-cmd-words">${escapeHtml(cmd.words || cmd.tool || "")}</span>`
+    + (st ? `<span class="now-cmd-state ${escapeHtml(cmd.state || "")}">${escapeHtml(st)}</span>` : "")
+    + (cmd.code ? `<button type="button" class="secondary small now-copy" data-copy-cmd title="Copy the command">${icon("content_copy")}<span>Copy</span></button>` : "");
+}
+function repaintNow(dom, run, live) {
+  const parts = live ? runNowParts(run) : [];
+  dom.now.hidden = !parts.length;
+  const keys = parts.map((p) => p.key).join("|");
+  if (dom.nowKeys !== keys) {
+    dom.nowKeys = keys;
+    dom.now.innerHTML = parts.length ? `<div class="run-sec-head">${icon("play_circle")}Now</div>` +
+      parts.map(() => `<div class="now-step"><div class="now-head"></div><div class="now-job"></div>` +
+        `<div class="now-cmd"><div class="now-cmd-head"></div><pre class="now-code" hidden><code></code></pre></div></div>`).join("") : "";
+    dom.nowShown = parts.map(() => ({}));
+  }
+  const els = dom.now.querySelectorAll(".now-step");
+  const nowS = Date.now() / 1000;
+  parts.forEach((p, i) => {
+    const el = els[i], shown = dom.nowShown[i];
+    if (!el || !shown) return;
+    const set = (k, sel, html) => { if (shown[k] !== html) { el.querySelector(sel).innerHTML = html; shown[k] = html; } };
+    set("head", ".now-head", nowHeadHtml(p));
+    set("job", ".now-job", p.job ? jobRowHtml(p.job, nowS, true) : "");
+    set("cmdHead", ".now-cmd-head", nowCmdHeadHtml(p.cmd));
+    const code = (p.cmd && p.cmd.code) || "";
+    if (shown.code !== code) {
+      const pre = el.querySelector(".now-code");
+      pre.querySelector("code").textContent = code;
+      pre.hidden = !code;
+      shown.code = code;
+    }
+  });
 }
 
 // ---- stream event ingest (DOM-independent; always updates the chat's record) -----------
@@ -1841,6 +1958,26 @@ function streamStatus(c, text) { if (c.run) { if (!c.planPending && c.run.starte
 function streamJob(c, msg) {
   if (!c.run) return;
   c.run.jobs = upsertJob(c.run.jobs || [], msg);
+  if (chatVisible(c)) repaintWorking();
+}
+// Where a step of the plan stands (the gateway's step_state): both plan cards and the run card follow it.
+function streamStep(c, msg) {
+  if (!c.run) return;
+  c.run.steps = c.run.steps || {};
+  if (!upsertStep(c.run.steps, msg)) return;
+  if (chatVisible(c)) { refreshPlanStates(c); repaintWorking(); }
+}
+// The command a step runs now (the gateway's run_command), shown at the top of the run card while it
+// runs; a finished one stays until the step runs its next command.
+function streamCommand(c, msg) {
+  if (!c.run) return;
+  const cmds = c.run.commands = c.run.commands || {};
+  const key = String(msg.step_key || "");
+  const prev = cmds[key];
+  if (msg.state === "running" || !prev || prev.tool !== msg.tool) {
+    if (msg.state !== "running" && !msg.words && !msg.code) return;
+    cmds[key] = { tool: msg.tool || "", words: msg.words || "", code: msg.code || "", state: msg.state || "running" };
+  } else cmds[key] = { ...prev, state: msg.state || prev.state };
   if (chatVisible(c)) repaintWorking();
 }
 function streamCode(c, code) {
@@ -1905,13 +2042,18 @@ function finishAssistantTurn(c, awaitingPlan) {
   // KEEP the run recap with it (thinking + steps/code) — collapsed, for later review —
   // instead of discarding it when the live bubble is replaced.
   const jobs = run.jobs || [];
-  if (run.text || run.thinking || run.feed.length || jobs.length) {
+  // A step still running did not finish; the saved answer keeps where each step ended (#121), and
+  // the chat's plan entry is drawn from it from now on.
+  if (!awaitingPlan) finishSteps(run.steps);
+  const steps = orderedSteps(run.steps);
+  if (run.text || run.thinking || run.feed.length || jobs.length || steps.length) {
     pushToSession(c.sid, {
       role: "assistant",
       content: run.text || "",
       thinking: run.thinking || "",
       feed: run.feed.slice(),
       jobs: jobs.slice(),
+      ...(steps.length ? { steps, stepsRun: run.runId || null } : {}),
       outcome: run.outcome || "done",
       ms: run.startedAt != null ? Date.now() - run.startedAt : null,
       streamId: run.streamId || null,
@@ -1924,6 +2066,60 @@ function finishAssistantTurn(c, awaitingPlan) {
   // If that chat is on screen, rebuild it from persisted messages so the live
   // (ephemeral) bubble is replaced by the saved final message cleanly.
   if (wasVisible) { state.streamDom = null; renderChat(); }
+}
+
+// ---- the run's step records (RCHENLAB/AiScientist#121) -----------------------------------------
+// What the gateway's `step_state` events say, kept per chat while its run goes on; the plan cards
+// draw their marks from them (planStepMarks), and the run card the steps running now (runNowParts).
+
+// One record in the run's map of steps, merged with the one before (a job update carries only the key).
+function upsertStep(steps, rec) {
+  if (!rec || !rec.key) return false;
+  const prev = steps[rec.key];
+  if (!prev && !STEP_STATES.includes(rec.state)) return false;
+  const clean = { ...rec };
+  for (const k of ["type", "run_id", "conversation_id", "stream_id"]) delete clean[k];
+  // A record with a state is the gateway's whole record: it replaces the one before, so a reason it
+  // cleared is gone. A job update names only the key and the job, and is merged into it.
+  steps[rec.key] = rec.state ? clean : { ...(prev || {}), ...clean };
+  return true;
+}
+
+// The run ended: a step still processing did not finish (the gateway marks it the same way).
+function finishSteps(steps) {
+  for (const r of Object.values(steps || {})) if (r && r.state === "processing") r.state = "stopped";
+}
+
+// The records in plan order: the planned steps by number, then the ones the run added.
+function orderedSteps(steps) {
+  return Object.values(steps || {}).map((r, i) => [r, i]).sort(([a, i], [b, j]) => {
+    const na = Number.isInteger(a.step) ? a.step : null, nb = Number.isInteger(b.step) ? b.step : null;
+    if ((na == null) !== (nb == null)) return na == null ? 1 : -1;
+    return ((na ?? a.index ?? 0) - (nb ?? b.index ?? 0)) || i - j;
+  }).map(([r]) => r);
+}
+
+// The marks of a saved plan (a chat message): from the run it was approved for, whose id the plan keeps.
+// Every saved answer of that run counts, in order — a continued run (same run id) overrides the steps
+// it ran again — and while that run goes on, its live records come last. A plan with no run id, and
+// the records of any other run (one with no plan card, a later run in the chat), mark nothing: a run
+// never marks a plan it did not run.
+function planStatesFor(s, m, c) {
+  if (!s || !m) return null;
+  const run = m.plan && m.plan.run;
+  if (!run) return null;
+  const msgs = s.messages || [];
+  const i = msgs.indexOf(m);
+  if (i < 0) return null;
+  const merged = {};
+  const take = (r) => { if (r && r.key) merged[r.key] = r; };
+  for (let j = i + 1; j < msgs.length; j++) {
+    const x = msgs[j];
+    if (x.stepsRun === run && Array.isArray(x.steps)) x.steps.forEach(take);
+  }
+  if (c && c.sid === s.id && c.run && c.run.runId === run && c.run.steps) Object.values(c.run.steps).forEach(take);
+  const out = orderedSteps(merged);
+  return out.length ? out : null;
 }
 
 function appendArtifacts(c, items, bundleUrl) {
@@ -3544,7 +3740,7 @@ function openWs(id) {
 // duplicate finished-run replay is suppressed, every one of these is a no-op for that chat until
 // its next chat_start clears the flag.
 const STREAM_TYPES = new Set([
-  "chat_token", "chat_thinking", "lab_progress", "run_status", "step_code", "run_job",
+  "chat_token", "chat_thinking", "lab_progress", "run_status", "step_code", "run_job", "step_state", "run_command",
   "chat_done", "chat_stopped", "chat_error", "artifacts", "run_complete",
 ]);
 
@@ -3648,6 +3844,8 @@ function handleRunEvent(c, msg) {
     case "run_status": streamStatus(c, msg.text); break;
     case "step_code": streamCode(c, msg.code); break;
     case "run_job": streamJob(c, msg); break;
+    case "step_state": streamStep(c, msg); break;
+    case "run_command": streamCommand(c, msg); break;
     case "chat_context": c.ctx = msg; if (chatVisible(c)) renderContextMeter(msg); break;
     case "step_provenance":
       // A step's record is re-sent when a retry changes it. The id carries the outcome, so the later
@@ -3688,7 +3886,7 @@ function handleRunEvent(c, msg) {
     case "plan_prompt":
       if (msg.saved) setChatRunning(c, false);
       holdPlanPrompt(c, "plan", { agenda: msg.agenda || [], doc: msg.plan || null, problems: msg.problems || [],
-                                    estimate: msg.estimate || null }, msg);
+                                    estimate: msg.estimate || null, notAvailable: msg.not_available || [] }, msg);
       break;
     case "plan_clarify":
       if (msg.saved) setChatRunning(c, false);
@@ -4904,6 +5102,56 @@ function planSettingText(value) {
   return String(value);
 }
 
+// ---- where each step of the plan stands, on the plan cards (RCHENLAB/AiScientist#121) ----------
+// The gateway sends one `step_state` record per step: processing, done (its result was accepted),
+// failed, skipped, stopped (it was running when the run ended), or pending (a step the run added and
+// has not reached). Both plan cards — the chat's entry and the side panel — mark their steps from the
+// same records, live and for a saved run, whose answer keeps them (`steps` in its saved message).
+const STEP_STATE_LABEL = { pending: "Not started", processing: "Processing", done: "Done", failed: "Failed",
+                           skipped: "Skipped", stopped: "Stopped" };
+const STEP_STATES = Object.keys(STEP_STATE_LABEL);
+
+function stepFlat(t) { return String(t == null ? "" : t).replace(/\s+/g, " ").trim(); }
+
+// Which row of a plan each record marks: by the plan document's step id, else its number, else its
+// text. A step the plan does not hold (added during the run) is an extra row under the plan's own.
+function planStepMarks(agenda, docSteps, records) {
+  const marks = agenda.map(() => null);
+  const extra = [];
+  for (const r of records || []) {
+    if (!r || !STEP_STATES.includes(r.state)) continue;
+    let i = r.id ? docSteps.findIndex((st) => st && st.id === r.id) : -1;
+    if (i < 0 && Number.isInteger(r.step) && r.step >= 1 && r.step <= agenda.length) i = r.step - 1;
+    if (i < 0 && r.text) { const t = stepFlat(r.text); i = agenda.findIndex((a) => stepFlat(a) === t); }
+    if (i >= 0 && !marks[i]) marks[i] = r; else if (i < 0) extra.push(r);
+  }
+  return { marks, extra, any: marks.some(Boolean) || extra.length > 0 };
+}
+
+// A step's mark: processing has a label and a moving indicator, done a check (on its number), the
+// others a label. A planned step with no record is "not started" once the plan has begun to run.
+function stepStateChip(rec, started) {
+  const st = rec ? rec.state : (started ? "pending" : "");
+  if (!st || st === "done") return "";
+  const why = rec && rec.reason ? ` title="${escapeHtml(rec.reason)}"` : "";
+  const lead = st === "processing" ? '<span class="step-spin" aria-hidden="true"></span>' : "";
+  return `<span class="plan-state ${st}"${why}>${lead}${escapeHtml(STEP_STATE_LABEL[st])}</span>`;
+}
+function stepNumHtml(rec, n) {
+  return rec && rec.state === "done"
+    ? `<span class="material-symbols-outlined msym" aria-label="Step ${n} done">check</span>` : String(n);
+}
+function stepRowClass(rec) { return rec ? ` st-${rec.state}` : ""; }
+
+// "2 done · 1 processing" for a plan's line under its title.
+function planStateSub(m) {
+  if (!m.any) return "";
+  const n = {};
+  for (const r of [...m.marks, ...m.extra]) if (r) n[r.state] = (n[r.state] || 0) + 1;
+  return ["processing", "done", "failed", "skipped", "stopped"].filter((k) => n[k])
+    .map((k) => `${n[k]} ${STEP_STATE_LABEL[k].toLowerCase()}`).join(" · ");
+}
+
 function planRunsOnText(where) {
   const w = String(where || "");
   if (w.startsWith("gpu:")) return "GPU job on HPC3";
@@ -5004,6 +5252,39 @@ function planSkillText(skill) {
   return `${skill.name || "unknown skill"} / version ${skill.version || "unknown"}`;
 }
 
+// The data a step reads (its `dataset`): the dataset's name, and a shared dataset's version and file.
+function planDatasetText(ds) {
+  if (!ds) return "";
+  const head = [ds.name || ds.id || "", ds.version || ""].filter(Boolean).join(" ");
+  return ds.file && ds.file !== ds.name ? `${head} · ${ds.file}` : head;
+}
+
+// The dataset chip of a step: each part editable in place while the plan waits, like a setting. A
+// changed name, version or file is checked by the server against the datasets you can use, and a
+// dataset the chat does not have is attached to it when the plan runs.
+function planDatasetChip(step, editable, compact = false) {
+  const ds = step && step.dataset;
+  if (!ds) return "";
+  // The chat's plan entry is one line per step: the dataset's name and version, the whole on hover.
+  if (compact) {
+    const head = [ds.name || ds.id || "", ds.version || ""].filter(Boolean).join(" ");
+    return `<span class="plan-step-skill plan-step-dataset" title="Reads ${escapeHtml(planDatasetText(ds))}">`
+      + `${planIcon("database")}<span>${escapeHtml(head)}</span></span>`;
+  }
+  const part = (key, text) => editable
+    ? `<span class="plan-dataset-part editable" data-edit="dataset" data-key="${key}" tabindex="0" role="button" `
+      + `title="Change the dataset's ${key}">${escapeHtml(text)}</span>`
+    : `<span class="plan-dataset-part">${escapeHtml(text)}</span>`;
+  const parts = [part("name", ds.name || ds.id || "")];
+  if (ds.version || (editable && ds.source === "shared")) parts.push(part("version", ds.version || "latest"));
+  if (ds.file && ds.file !== ds.name) parts.push(`<span class="plan-dataset-sep">·</span>` + part("file", ds.file));
+  else if (editable && ds.source === "shared") parts.push(`<span class="plan-dataset-sep">·</span>` + part("file", "whole version"));
+  const where = ds.source === "shared" ? "shared dataset" : ds.source === "own" ? "your data" : "dataset";
+  return `<span class="plan-step-skill plan-step-dataset" title="The data this step reads (${where}). `
+    + `A dataset this chat does not have is attached to it when the plan runs.">${planIcon("database")}`
+    + `<span>Reads</span>${parts.join(" ")}</span>`;
+}
+
 function stepProvenanceMarkdown(record) {
   const skills = (record.skills || []).map((skill) => `${planSkillText(skill)} (${record.status === "used" && skill.status === "used" ? "recorded used" : "failed; no successful use"})`);
   const changedSkills = (record.skills || []).filter((skill) => !(record.planned_skills || []).some((planned) => planned.name === skill.name && planned.version === skill.version));
@@ -5018,7 +5299,17 @@ function stepProvenanceMarkdown(record) {
     + ((record.provider_changes || []).length ? `\n- Provider changed from approved plan: ${planSettingText(record.provider_changes)}` : "");
 }
 
-function planStepHtml(text, n, step, revised, showWhere, edit) {
+// A step the run added (hypothesis-driven exploration), under the plan's own steps on the side panel.
+function planAddedStepHtml(r) {
+  const parts = planStepParts(r.text || r.title || "");
+  return `<li class="plan-step added${stepRowClass(r)}"><span class="plan-step-num">${stepNumHtml(r, "+")}</span>`
+    + `<div class="plan-step-main"><div class="plan-step-head"><span class="plan-step-title">${renderMarkdown(parts.title)}</span>`
+    + stepStateChip(r, true) + `<span class="plan-step-flag added">Added during the run</span></div>`
+    + (parts.body ? `<div class="plan-step-body">${renderMarkdown(parts.body)}</div>` : "") + `</div></li>`;
+}
+
+// `mark`: {rec} — where the step stands once the plan runs (null before it runs: no mark at all).
+function planStepHtml(text, n, step, revised, showWhere, edit, mark) {
   const parts = planStepParts(text);
   const settings = (step && step.settings) || {};
   const editable = !!(edit && step && step.id);
@@ -5058,7 +5349,7 @@ function planStepHtml(text, n, step, revised, showWhere, edit) {
       + `aria-label="Run step ${n} without assigned skills" title="Run this step without assigned skills">${planIcon("close")}</button>` : "")
     + `</span>`).join("") : `<span class="plan-step-skill">No skill assigned</span>`;
   const providers = planTools(step).map((tool) => `<span class="plan-step-skill plan-step-provider" title="Planned tool provider">${escapeHtml(planToolText(tool))}</span>`).join("");
-  const meta = `<div class="plan-step-meta">${providers}${skill}${chips}`
+  const meta = `<div class="plan-step-meta">${providers}${planDatasetChip(step, editable)}${skill}${chips}`
     + (where ? `<span class="plan-where">${planIcon(where.startsWith("Runs on") ? "dns" : "memory")}${escapeHtml(where)}</span>` : "")
     + `</div>`;
   // What the step should leave behind: declared by its skill, or by the active pipeline for its tool.
@@ -5072,12 +5363,14 @@ function planStepHtml(text, n, step, revised, showWhere, edit) {
       + `</ul></div>`
     : "";
   const open = !!parts.body && planStepOpen(text, revised);
-  return `<li class="plan-step${revised ? " revised" : ""}${open ? " open" : ""}"`
+  const rec = mark ? mark.rec : null;
+  return `<li class="plan-step${revised ? " revised" : ""}${open ? " open" : ""}${stepRowClass(rec)}"`
     + (editable ? ` data-id="${escapeHtml(step.id)}"` : "") + `>`
-    + `<span class="plan-step-num">${n}</span>`
+    + `<span class="plan-step-num">${stepNumHtml(rec, n)}</span>`
     + `<div class="plan-step-main">`
     + `<div class="plan-step-head"><span class="plan-step-title${editable ? " editable" : ""}"${editAttrs("title")}>`
     + `${renderMarkdown(parts.title)}</span>`
+    + (mark ? stepStateChip(rec, true) : "")
     + (revised ? `<span class="plan-step-flag">Revised</span>` : "")
     + planTools(step).map((tool) => `<code class="plan-step-tool">${escapeHtml(tool.tool || "unknown tool")}</code>`).join("")
     + planUntestedFlag(step)
@@ -5191,7 +5484,10 @@ function planCardHtml(agenda, doc, revisedSteps, opts) {
   const mode = o.mode || "review";
   const docSteps = (doc && doc.steps) || [];
   const revised = new Set((revisedSteps || []).map(Number));
-  const { sub, onePlace } = planSub(agenda, docSteps);
+  const { sub: count, onePlace } = planSub(agenda, docSteps);
+  // Where each step stands, once the plan runs (#121): the same marks as the chat's entry.
+  const marks = mode === "review" ? planStepMarks(agenda, docSteps, null) : planStepMarks(agenda, docSteps, o.states);
+  const sub = [count, planStateSub(marks)].filter(Boolean).join(" · ");
   const prose = agenda.map((s, i) => [s, i + 1]).filter(([s]) => planStepParts(s).body);
   const allOpen = prose.length > 0 && prose.every(([s, n]) => planStepOpen(s, revised.has(n)));
   const head = `<div class="plan-head"><span class="plan-head-icon">${planIcon("checklist")}</span>`
@@ -5202,7 +5498,9 @@ function planCardHtml(agenda, doc, revisedSteps, opts) {
   // nothing, the plan is cancelled).
   const edit = mode === "review" && doc && doc.yaml ? { remove: agenda.length > 1 } : null;
   const steps = `<ol class="plan-steps">`
-    + agenda.map((s, i) => planStepHtml(s, i + 1, docSteps[i], revised.has(i + 1), !onePlace, edit)).join("")
+    + agenda.map((s, i) => planStepHtml(s, i + 1, docSteps[i], revised.has(i + 1), !onePlace, edit,
+                                        marks.any ? { rec: marks.marks[i] } : null)).join("")
+    + marks.extra.map((r) => planAddedStepHtml(r)).join("")
     + `</ol>`;
   if (mode !== "review") {
     return head + steps + planEstimateHtml(o.estimate)
@@ -5260,20 +5558,33 @@ function planEntryHtml(agenda, doc, opts) {
   const o = opts || {};
   const docSteps = (doc && doc.steps) || [];
   const revised = new Set((o.revised || []).map(Number));
-  const { sub } = planSub(agenda, docSteps);
-  const rows = agenda.map((s, i) => `<li class="plan-entry-step${revised.has(i + 1) ? " revised" : ""}">`
-    + `<span class="plan-entry-num">${i + 1}</span>`
+  const { sub: steps } = planSub(agenda, docSteps);
+  // Where each step stands, once the plan runs (#121): the same marks as the side panel's card.
+  const m = planStepMarks(agenda, docSteps, o.states);
+  const sub = [steps, planStateSub(m)].filter(Boolean).join(" · ");
+  const rows = agenda.map((s, i) => `<li class="plan-entry-step${revised.has(i + 1) ? " revised" : ""}${stepRowClass(m.marks[i])}">`
+    + `<span class="plan-entry-num">${stepNumHtml(m.marks[i], i + 1)}</span>`
     + `<span class="plan-entry-title">${escapeHtml(planStepParts(s).title.replace(/[*`]/g, ""))}</span>`
+    + stepStateChip(m.marks[i], m.any)
     + planTools(docSteps[i]).map((tool) => `<code class="plan-step-tool">${escapeHtml(tool.tool || "unknown tool")}</code>`
       + `<span class="plan-step-skill plan-step-provider">${escapeHtml(planToolText(tool))}</span>`).join("")
     + (planSkills(docSteps[i]).length ? planSkills(docSteps[i]).map((skill) =>
       `<span class="plan-step-skill" title="Planned assignment; successful use is recorded separately">${planIcon("extension")}<span>${escapeHtml(planSkillText(skill))}</span></span>`).join("")
       : `<span class="plan-step-skill">No skill assigned</span>`)
     + planUntestedFlag(docSteps[i])
-    + `</li>`).join("");
+    + planDatasetChip(docSteps[i], false, true)
+    + `</li>`).join("")
+    + m.extra.map((r) => `<li class="plan-entry-step added${stepRowClass(r)}" title="Added during the run">`
+      + `<span class="plan-entry-num">${stepNumHtml(r, "+")}</span>`
+      + `<span class="plan-entry-title">${escapeHtml(stepFlat(r.title || planStepParts(r.text || "").title).replace(/[*`]/g, ""))}</span>`
+      + stepStateChip(r, true) + `<span class="plan-step-skill">Added during the run</span></li>`).join("");
   const refused = (o.problems || []).length
     ? `<div class="plan-note bad">${planIcon("error")}<span>Your edit was not applied — the plan is unchanged. Open the plan to see why.</span></div>`
     : "";
+  // Steps of the request that are not in the plan because no tested tool or skill does them, while
+  // the deployment runs no code the AI writes (RCHENLAB/AiScientist#150). Shown before approval.
+  const unavailable = (o.notAvailable || []).map((line) =>
+    `<div class="plan-note unavailable">${planIcon("block")}<span>${planNoteMd(line)}</span></div>`).join("");
   const actions = o.pending
     ? `<button class="primary" data-plan="approve"${o.dirty ? ' disabled title="Apply or reset your edit first"' : ""}>${planIcon("play_arrow")}Run this plan</button>`
       + `<button class="secondary" data-plan="open">${planIcon("right_panel_open")}<span>Open plan</span></button>`
@@ -5284,10 +5595,17 @@ function planEntryHtml(agenda, doc, opts) {
       + `<button class="secondary small" data-plan="open">${planIcon("right_panel_open")}<span>View plan</span></button>`;
   return `<div class="plan-head"><span class="plan-head-icon">${planIcon("checklist")}</span>`
     + `<div><div class="plan-title">${o.pending ? "Proposed plan" : "Plan"}</div><div class="plan-sub">${sub}</div></div></div>`
-    + (o.pending ? planRevisedNote(revised) + refused : "")
+    + (o.pending ? planRevisedNote(revised) + refused + unavailable : "")
     + planDatasetsHtml(doc)
     + `<ol class="plan-entry-steps">${rows}</ol>`
     + `<div class="plan-actions-row">${actions}</div>`;
+}
+
+// One line of the server's Markdown (**bold**, `code`), escaped first.
+function planNoteMd(text) {
+  return escapeHtml(String(text || ""))
+    .replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>")
+    .replace(/`([^`]+)`/g, "<code>$1</code>");
 }
 
 // Structured edit feedback. The accepted steps remain visible until the server validates the
@@ -5306,7 +5624,9 @@ function planEditorHtml(doc) {
   const step = change && (doc.steps || []).find((s) => s.id === change.id);
   const description = !change ? "" : `${step ? step.title || change.id : change.id}: `
     + (change.remove ? "remove this step" : change.skill === null ? "remove the skill"
-      : change.title !== undefined ? `title → ${change.title}` : `${change.setting} → ${change.value || "(empty)"}`);
+      : change.title !== undefined ? `title → ${change.title}`
+      : change.dataset !== undefined ? `dataset ${change.dataset} → ${change.value || "(empty)"}`
+      : `${change.setting} → ${change.value || "(empty)"}`);
   return `<div class="plan-edit-feedback" role="status"><strong>Your change has not been applied. The steps above are unchanged.</strong>`
     + (description ? `<p>${escapeHtml(description)}</p>` : "")
     + (problems.length ? `<ul>${problems.map((x) => `<li>${escapeHtml(planProblemText(x))}</li>`).join("")}</ul>` : "")
@@ -5403,8 +5723,10 @@ function planYamlValue(literal, typed) {
 }
 
 // The plan document with one change made to it. `change`: {id, title} | {id, setting, value} (the
-// value as typed) | {id, remove: true} | {id, skill: null} (the step goes without its skill). {yaml} or {error}: a value of the wrong kind, or a document
-// edited by hand into a shape where the line is not where the server writes it.
+// value as typed) | {id, dataset, value} (a field of the step's dataset: name, version or file) |
+// {id, remove: true} | {id, skill: null} (the step goes without its skill). {yaml} or {error}: a value
+// of the wrong kind, or a document edited by hand into a shape where the line is not where the server
+// writes it.
 function planYamlEdit(yaml, change) {
   const lines = String(yaml == null ? "" : yaml).split("\n");
   const indent = (l) => l.length - l.trimStart().length;
@@ -5437,6 +5759,46 @@ function planYamlEdit(yaml, change) {
     }
     return removed ? { yaml: lines.join("\n") }
       : { error: "The skill is not where the plan document keeps it: ask for this change in words." };
+  }
+  if (change.dataset !== undefined) {
+    const key = String(change.dataset);
+    const value = String(change.value == null ? "" : change.value).replace(/\s+/g, " ").trim();
+    if (!["name", "version", "file"].includes(key)) return { error: "Ask for this change in words." };
+    if (key === "name" && !value) return { error: "A dataset needs its name. To read no dataset, ask in words." };
+    let block = -1;
+    let last = -1;
+    for (let i = start + 1; i < end; i += 1) {
+      if (block < 0) {
+        if (indent(lines[i]) === keyCol && /^\s*dataset:\s*$/.test(lines[i])) { block = i; last = i; }
+        continue;
+      }
+      if (lines[i].trim() && indent(lines[i]) <= keyCol) break;
+      last = i;
+    }
+    if (block < 0) return { error: "This step names no dataset: say in words which data it reads." };
+    const written = (k) => {
+      for (let i = block + 1; i <= last; i += 1) {
+        if (new RegExp(`^\\s*${k}:`).test(lines[i]) && indent(lines[i]) === keyCol + 2) return i;
+      }
+      return -1;
+    };
+    const blank = key === "version" ? /^(latest)?$/i.test(value) : key === "file" ? /^(whole version)?$/i.test(value) : false;
+    const at = written(key);
+    if (blank) {
+      if (at >= 0) lines.splice(at, 1);
+    } else if (at >= 0) {
+      lines[at] = `${" ".repeat(keyCol + 2)}${key}: ${JSON.stringify(value)}`;
+    } else {
+      lines.splice(last + 1, 0, `${" ".repeat(keyCol + 2)}${key}: ${JSON.stringify(value)}`);
+    }
+    // Another name: the server finds that dataset again, so what it filled in for the old one goes.
+    if (key === "name") {
+      for (const k of ["id", "source"]) {
+        const i = written(k);
+        if (i >= 0) lines.splice(i, 1);
+      }
+    }
+    return { yaml: lines.join("\n") };
   }
   if (change.title !== undefined) {
     const title = String(change.title).replace(/\s+/g, " ").trim();
@@ -5550,11 +5912,15 @@ function wirePlanCardEdits(host, c, doc) {
     const step = steps.find((s) => s.id === id) || {};
     li.querySelectorAll("[data-edit]").forEach((el) => {
       const isTitle = el.dataset.edit === "title";
+      const isDataset = el.dataset.edit === "dataset";
       const key = el.dataset.key || "";
       const start = () => planInlineEdit(li, el,
-        isTitle ? (step.title || el.textContent) : planSettingInput((step.settings || {})[key]),
-        isTitle ? "The step's title" : `The value of ${key}`,
-        (value) => commitPlanChange(c, isTitle ? { id, title: value } : { id, setting: key, value }), c);
+        isTitle ? (step.title || el.textContent)
+          : isDataset ? String((step.dataset || {})[key] || "")
+          : planSettingInput((step.settings || {})[key]),
+        isTitle ? "The step's title" : isDataset ? `The dataset's ${key}` : `The value of ${key}`,
+        (value) => commitPlanChange(c, isTitle ? { id, title: value }
+          : isDataset ? { id, dataset: key, value } : { id, setting: key, value }), c);
       el.addEventListener("click", start);
       el.addEventListener("keydown", (ev) => {
         if (ev.target !== el || (ev.key !== "Enter" && ev.key !== " ")) return;
@@ -5598,7 +5964,8 @@ function showPlanPanel(agenda) {
   state.planAgenda = agenda || [];
   const c = activeChat();     // the buttons answer THIS chat's run, whatever is on screen later
   el.innerHTML = planEntryHtml(state.planAgenda, state.planDoc, { pending: true, revised: state.planRevisedSteps,
-    problems: state.planProblems, dirty: !!state.planDraftYaml });
+    problems: state.planProblems, dirty: !!state.planDraftYaml,
+    notAvailable: (state.planPrompt && state.planPrompt.notAvailable) || [] });
   wirePlanEntry(el, c);
   // The whole plan is in the side panel: it opens the first time each version of the plan is shown
   // in its chat (also when it arrived while another chat was on screen), not on every redraw.
@@ -5653,15 +6020,15 @@ function drawAnsweredPlan(c = activeChat()) {
 // (`state.planView`), else the plan waiting in this chat, else the one it answered and the PI has,
 // else the last plan this chat approved.
 function chatPlanView(c = activeChat()) {
-  if (state.planView) return { mode: "saved", ...state.planView };
+  const s = activeSession();
+  if (state.planView) return { mode: "saved", ...state.planView, states: planStatesFor(s, state.planViewMsg, c) };
   if (c && c.plan && c.plan.kind === "plan") {
     return { mode: "review", agenda: c.plan.agenda || [], doc: c.plan.doc || null, revised: c.plan.revised || [],
              estimate: c.plan.estimate || null };
   }
   if (c && c.answered) return { mode: "status", ...c.answered };
-  const s = activeSession();
   const saved = s && [...s.messages].reverse().find((m) => m.kind === "plan" && m.plan);
-  return saved ? { mode: "saved", ...saved.plan } : null;
+  return saved ? { mode: "saved", ...saved.plan, states: planStatesFor(s, saved, c) } : null;
 }
 
 function renderPlanPanel() {
@@ -5677,7 +6044,7 @@ function renderPlanPanel() {
   }
   host.innerHTML = `<div class="plan-card plan-sheet plan-panel-card" data-prompt="plan">`
     + planCardHtml(view.agenda || [], view.doc || null, view.revised || [],
-                   { mode: view.mode, status: view.status || "", estimate: view.estimate || null })
+                   { mode: view.mode, status: view.status || "", estimate: view.estimate || null, states: view.states || null })
     + `</div>`;
   wirePlanSteps(host, view.agenda || []);
   if (view.mode !== "review") return;
@@ -5808,7 +6175,9 @@ function planSavedMessage(p) {
   return { role: "assistant", kind: "plan",
            content: "## 📋 Research plan\n\n" + p.agenda.map((s, i) => `${i + 1}. ${s}`).join("\n")
              + settings + provenance + planEstimateMarkdown(p.estimate),
-           plan: { agenda: p.agenda, doc: p.doc || null, estimate: p.estimate || null, status: "Approved" } };
+           // The run it was approved for: its step marks come from that run only (#121).
+           plan: { agenda: p.agenda, doc: p.doc || null, estimate: p.estimate || null, status: "Approved",
+                   ...(p.run ? { run: p.run } : {}) } };
 }
 
 function planModelContent(m) {
@@ -5932,6 +6301,14 @@ async function submitDecision(choice, c = activeChat()) {
       method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ connection_id: state.connectionId, conversation_id: c.sid, action: "revise", feedback: choice || "" }),
     });
+    // "Abort the run" ends the run as Stop does (the server answers "stopping").
+    const body = res && res.ok && typeof res.clone === "function" ? await res.clone().json().catch(() => null) : null;
+    if (body && body.status === "stopping") {
+      const stop = chatVisible(c) ? $("chatStop") : null;
+      if (stop) { stop.disabled = true; stop.textContent = "■ Stopping…"; }
+      toast("Aborting — the run is ending…");
+      return;
+    }
     if (await planAnswerStale(res)) { planNotDelivered(c); return; }
     toast(choice ? "Decision recorded — continuing…" : "Continuing…");
   } catch (err) { toast("Failed to send decision: " + err.message); }
@@ -6012,8 +6389,21 @@ function hidePlanPanel(c = activeChat()) {
   const closed = c.plan && c.plan.kind === "plan" ? c.plan : null;
   if (closed) c.answered = { agenda: closed.agenda || [], doc: closed.doc || null, revised: closed.revised || [],
                              status: "This plan is no longer waiting for a decision." };
+  // So is a decision: it timed out (the run went on with the agent's judgment) or the run stopped.
+  // Its options go, so none is clicked for nothing, and it is not drawn again.
+  const lapsed = !!c.plan && c.plan.kind === "decision";
   releasePlanPrompt(c);
   if (closed && chatVisible(c)) { removePlanCard(); drawAnsweredPlan(c); renderPlanPanel(); }
+  if (lapsed && chatVisible(c) && state.planCardEl && state.planCardEl.dataset.prompt === "decision") {
+    const opts = state.planCardEl.querySelector(".clarify-options");
+    if (opts) {
+      const note = document.createElement("div");
+      note.className = "plan-actions-status";
+      note.textContent = "This decision is no longer waiting for an answer.";
+      opts.replaceWith(note);
+    }
+    state.planCardEl = null;
+  }
   if (chatVisible(c)) $("chatInput").placeholder = DEFAULT_PLACEHOLDER;
   updateComposerButton();
 }
@@ -10126,6 +10516,8 @@ function renderSkillRequests() {
       `${(x.skills || []).length ? " · vetted skill: " + x.skills.map(escapeHtml).join(", ") : ""}` +
       `${(x.induced_skills || []).length ? " · induced skill: " + x.induced_skills.map(escapeHtml).join(", ") : ""}</p>` +
       ((x.untested_steps || []).length ? `<p class="skill-origin"><span class="muted">Untested steps:</span> ${x.untested_steps.map((t) => escapeHtml(planStepParts(t).title)).join(" · ")}</p>` : "") +
+      // Steps that did not run: no tested tool or skill does them, and model-written code is off (#150).
+      ((x.not_available_steps || []).length ? `<p class="skill-origin"><span class="muted">Not available:</span> ${x.not_available_steps.map((t) => escapeHtml(planStepParts(t).title || t)).join(" · ")}</p>` : "") +
       (x.raw_expired ? `<p class="skill-origin muted">Past the retention period: the request text and the code were removed.</p>` : "") +
       `<div class="row-actions"><button class="ghost small" data-req-view="${escapeHtml(x.id)}">${open ? "Hide details" : "View request and code"}</button>${moves}</div>` +
       (open ? `<div class="skill-detail">${open}</div>` : "") +

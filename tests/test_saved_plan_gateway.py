@@ -331,3 +331,40 @@ def test_a_plan_saved_before_a_deploy_that_drops_a_setting_still_runs(lab_gatewa
     path.write_text(json.dumps(state), encoding="utf-8")
     _reply(conn, "approve", run_id=rid)
     assert env.calls and saved_plans.load(art)["state"] == "approved"
+
+
+def test_approving_a_plan_that_chose_a_dataset_in_review_runs_on_that_dataset(lab_gateway, monkeypatch, tmp_path):
+    """RCHENLAB/AiScientist#120: a chat with no dataset, a plan whose step names one chosen in review.
+    Approving attaches it, and the run stages and reads THAT dataset before the plan runs."""
+    env = lab_gateway
+    conn = env.connection()
+    rid, art, current, _state = _show(conn)
+    data = tmp_path / "chosen.csv"
+    data.write_text("cell,RHO\nc1,5\nc2,0\n", encoding="utf-8")
+    path = art / "plan" / "v01.yaml"
+    path.write_text(path.read_text(encoding="utf-8").replace(
+        "    tool: mcp_run_scanpy_qc\n",
+        "    tool: mcp_run_scanpy_qc\n    dataset:\n      name: chosen.csv\n      source: own\n      id: u-1\n", 1),
+        encoding="utf-8")
+    seen = {}
+
+    def chosen(_conn, state, plan_yaml):
+        seen["plan"] = plan_yaml
+        assert state["conversation_id"] == "conv-A" and not state["run_options"].get("datasets")
+        return {"datasets": [{"path": str(data), "name": "chosen.csv", "role": "primary"}],
+                "shared_datasets": [], "own_ids": [1], "attached": ["chosen.csv"], "primary": "chosen.csv"}
+
+    monkeypatch.setattr(gw, "_plan_chosen_inputs", chosen)
+    attached = []
+    monkeypatch.setattr(gw, "_attach_plan_inputs", lambda _c, cid, ch: attached.append((cid, ch["attached"])) or None)
+    pushed: list = []
+    push = conn.push
+    monkeypatch.setattr(conn, "push", lambda payload, **kw: (pushed.append(payload), push(payload, **kw))[1])
+    _reply(conn, "approve", run_id=rid)
+    assert "name: chosen.csv" in seen["plan"] and attached == [("conv-A", ["chosen.csv"])]
+    state = json.loads((art / "process" / "run_state.json").read_text(encoding="utf-8"))
+    assert state["decisions"]["dataset_path"] == str(data), "the run read the dataset chosen in review"
+    assert state["decisions"]["datasets"][0]["name"] == "chosen.csv"
+    assert any("Attached to this chat for the approved plan: chosen.csv" in str(p.get("text"))
+               for p in pushed if p.get("type") == "lab_progress")
+    assert env.calls, "the approved plan ran"

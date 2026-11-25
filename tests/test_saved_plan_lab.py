@@ -149,7 +149,9 @@ def test_saved_question_reads_document_settings_and_preserves_plan():
     with pytest.raises(WaitingPlan):
         lab.run(doc.request, saved_plan=doc, plan_review=wait,
                 saved_plan_decision={"action": "revise", "feedback": "Why this mitochondrial cutoff?"})
-    assert "max_pct_mt: 25" in prompts[0][1]["content"]
+    # The reply is read first (a question); the answer is given the plan document with its settings.
+    answered = [m for m in prompts if "answering a researcher's question" in m[0]["content"]]
+    assert answered and "max_pct_mt: 25" in answered[0][1]["content"]
 
 
 def test_saved_clarification_reuses_feedback_without_initial_planner(monkeypatch):

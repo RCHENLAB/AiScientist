@@ -169,6 +169,10 @@ if "rows" in result:
             break
         result["rows"].append(row)
     result["rows_omitted"] = len(rows) - len(result["rows"])
+    if result["rows_omitted"]:
+        # How to reach the rest without code (model-written code is off by default, issue 150).
+        result["rows_note"] = (f"{result['rows_omitted']} rows are not shown. get_summary with gene set to one "
+                               "gene ranks that gene alone; read_text reads full_table a page at a time.")
 if len(json.dumps(result)) > 14000:
     result = {k: result[k] for k in ("state", "query_id") if k in result and len(json.dumps(result[k])) < 1000}
     result.update(response_omitted=True, full_result="gene_expression/mcp_result.json")

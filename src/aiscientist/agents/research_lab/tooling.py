@@ -356,9 +356,15 @@ def _known_tool_names() -> frozenset[str]:
         # run_in_environment is only built for a live HPC3 session, so the bare catalog lacks it;
         # a step that names it must still be recognised as that tool's step.
         from ..mcp_bridge import configured_tool_names
-        # The gateway owns the report step; it is not a Scientist catalog tool.
+        # The gateway owns the report step; it is not a Scientist catalog tool. The tools that
+        # model-written code needs stay known while the deployment withholds them, so a step that
+        # names one is still recognised as that tool's step, and held (code_gate.py).
+        from ..code_policy import WITHHELD_TOOLS
+        # The HPC3 session's tools (the lookups read_text, list_dir, ...) are built per session too.
+        from ...hpc.shell import SHELL_TOOLS
         return (frozenset(t.name for t in build_scientist_catalog())
-                | {"run_in_environment", REPORT_TOOL} | configured_tool_names())
+                | {"run_in_environment", REPORT_TOOL} | WITHHELD_TOOLS | set(SHELL_TOOLS)
+                | configured_tool_names())
     except Exception:  # noqa: BLE001 - classification degrades, it does not fail
         return frozenset()
 
@@ -588,6 +594,21 @@ def _tool_skill(tool: str) -> "Skill | None":
         return get_skill(skill_name) if skill_name else None
     except Exception:  # noqa: BLE001 - an unreadable manifest names no skill
         return None
+
+
+# The arguments of a tool that state a fact of ONE library rather than a choice for the whole run. A
+# plan holds one value per setting, so over several libraries such a value is right for some of them
+# at most: run 6e5a33230a46 bound two mouse libraries and a human one, its plan said species = human,
+# and that value was forced onto every call (the model's mouse on the mouse libraries' calls became
+# human). CellQC reads species and chemistry from each library when they are left out, and QCs each
+# species on its own. ``samples`` and the input paths are not here: they choose which libraries the
+# call QCs, a choice for the whole call that the plan keeps.
+_PER_LIBRARY_SETTINGS = {"run_cellqc": ("species", "chemistry")}
+
+
+def per_library_settings(tool: str) -> "tuple[str, ...]":
+    """The settings of ``tool`` that describe one library (see ``_PER_LIBRARY_SETTINGS``)."""
+    return _PER_LIBRARY_SETTINGS.get(canonical_tool_name(tool or ""), ())
 
 
 def _tool_ends_step(tool: str) -> bool:

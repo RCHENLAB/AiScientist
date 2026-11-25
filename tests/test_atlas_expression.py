@@ -1,5 +1,6 @@
 """Offline bridge contracts; no containers, network, scanpy or real h5ad."""
 import json
+import re
 import shlex
 from pathlib import Path
 
@@ -201,6 +202,7 @@ def test_release_metadata_checksum_tier_and_exposure(release, monkeypatch):
 
 
 @pytest.mark.parametrize("value", ["", "heca/latest=/shared/heca/x.h5ad", "heca/v1=relative/x.h5ad"])
+@pytest.mark.usefixtures("model_written_code")
 def test_without_a_configured_atlas_the_tools_are_not_offered(release, monkeypatch, value):
     """A deployment that lists no atlas would offer nine tools that always fail."""
     monkeypatch.setenv("AISCIENTIST_ATLAS_FILES", value)
@@ -367,6 +369,7 @@ def test_large_response_survives_stdout_tail(release, tmp_path, monkeypatch, cap
     assert json.loads((tmp_path / "manifest.json").read_text())["atlas"]["version"] == "heca/v2026.11"
 
 
+@pytest.mark.usefixtures("model_written_code")
 def test_direct_skill_refused_even_with_model_override_arguments(release):
     runner = Runner()
     tool = tools(runner)["run_in_environment"]
@@ -532,3 +535,205 @@ def test_responses_and_the_saved_result_name_results_files_not_hpc3_paths(releas
     saved = (artifacts / "gene_expression" / "mcp_result.json").read_text()
     assert str(tmp_path) not in saved and str(data) not in saved
     assert json.loads(saved)["file"] == "gene_expression/q/report.md"
+
+
+# --- RCHENLAB #151 item 4 (C3): an Atlas run reads its own result files without run_code -------------
+
+C3_QUERY = "HRCA_snRNA_allcells__LRAT_RLBP1_RHO_ABCA4"
+C3_STEP = ("**Cell-type expression summary** — Rank the cell types for LRAT, RLBP1, RHO and ABCA4 with "
+           "`get_summary` at level celltype.")
+
+
+def _summary_table(n_types=160):
+    """summary_celltype.tsv as the server writes it: one row per gene and cell type."""
+    head = ("gene\tcelltype\tn_cells\tn_expressing\tpct_expressing\tmean_lognorm\tpseudobulk_cp10k\t"
+            "n_donors\tdonor_median_cp10k\tdonor_q25_cp10k\tdonor_q75_cp10k\tfrac_donors_detected\t"
+            "rank_pseudobulk")
+    rows = [f"{gene}\tType_{i:03d}\t{1000 + i}\t{i}\t{i / 10:.2f}\t0.01\t{(n_types - i) / 100:.3f}\t"
+            f"{10 + i % 90}\t0.1\t0.05\t0.2\t0.5\t{i + 1}"
+            for gene in ("LRAT", "RLBP1", "RHO", "ABCA4") for i in range(n_types)]
+    return "\n".join([head, *rows]) + "\n", rows
+
+
+def _collected_summary(tmp_path, monkeypatch, capsys, artifacts, table, rows):
+    """Run the image's real collector on a get_summary answer: what the tool hands the model, and the
+    files it leaves in the run's HPC3 artifacts."""
+    query = tmp_path / "server-data" / "atlas-expression-exploration" / C3_QUERY
+    query.mkdir(parents=True)
+    (query / "state.json").write_text("{}")
+    (query / "summary_celltype.tsv").write_text(table)
+    for name in ("dotplot_majorclass.png", "dotplot_majorclass.pdf"):
+        (query / name).write_bytes(b"\x89PNG plot")
+    fields = table.splitlines()[0].split("\t")
+    answer = {"query_id": C3_QUERY, "level": "celltype", "table": str(query / "summary_celltype.tsv"),
+              "rows": [dict(zip(fields, row.split("\t"))) for row in rows]}
+    raw, source = tmp_path / "result.json", tmp_path / "atlas.h5ad"
+    raw.write_text(json.dumps(answer))
+    source.write_text("atlas; never parsed")
+    for key, value in {"AISCI_DATA_DIR": query.parent.parent, "AISCIENTIST_ARTIFACTS": artifacts,
+                       "ATLAS_H5AD": source, "AISCI_MCP_RESULT": raw,
+                       "AISCI_ATLAS_RELEASE": "heca/v2026.11"}.items():
+        monkeypatch.setenv(key, str(value))
+    exec(atlas.COLLECT, {})
+    return capsys.readouterr().out
+
+
+def _hpc3_login():
+    """The login node over this machine's files: GNU ``stat -c`` as HPC3 answers it (macOS has none)."""
+    from test_hpc_shell import LocalReadRemote
+
+    class Login(LocalReadRemote):
+        def exec(self, command, timeout=60):
+            if command.startswith("stat -c "):
+                path = Path(shlex.split(command)[3])
+                if not path.exists():
+                    return ExecResult(command, 0, f"stat: cannot statx '{path}'", "")
+                kind = "regular file" if path.is_file() else "directory"
+                return ExecResult(command, 0, f"{path}|{kind}|{path.stat().st_size}|2026-11-23 14:30:00|"
+                                              "alice|-rw-r--r--", "")
+            return super().exec(command, timeout)
+    return Login()
+
+
+C3_QUERY_STEP = ("**Full-atlas expression query** — Resolve LRAT, CRALBP, rho and ABCR with "
+                 "`resolve_genes`, then stream the atlas with `submit_query` and `query_status`.")
+REFUSED_READ = ("run_code", {"code": "import pandas as pd\nprint(pd.read_csv("
+                                     f"'gene_expression/{C3_QUERY}/summary_celltype.tsv', sep='\\t'))"})
+
+
+def _c3_tools(release, tmp_path, monkeypatch, capsys):
+    """C3's tools with model-written code off: the Atlas tools on a runner that answers as the image
+    does, and the lookups on the run's HPC3 folder, where the collector left the result files."""
+    from aiscientist.hpc import shell as hs
+
+    hpc3 = tmp_path / "hpc3-run"
+    artifacts, work = hpc3 / "analysis" / "artifacts", hpc3 / "analysis" / "work"
+    work.mkdir(parents=True)
+    table, rows = _summary_table()
+    summary_stdout = _collected_summary(tmp_path, monkeypatch, capsys, artifacts, table, rows)
+    answers = {
+        "resolve_genes": {"resolution": RESOLUTION},
+        "submit_query": {"query_id": C3_QUERY, "state": "COMPLETED", "resolution": RESOLUTION},
+        "query_status": {"query_id": C3_QUERY, "state": "COMPLETED", "returncode": 0},
+    }
+    runner = Runner()
+
+    def run_in_image(command, image, **kwargs):
+        tool = re.search(r"AISCI_MCP_TOOL=(\w+)", command).group(1)
+        runner.calls.append(tool)
+        if tool == "get_summary":
+            return {"status": "ok", "returncode": 0, "stdout": summary_stdout}
+        return {"status": "ok", "returncode": 0, "stdout": json.dumps({"result": answers[tool], "atlas": {
+            "path": Runner.dataset_path, "version": "heca/v2026.11", "size_bytes": 1, "mtime_ns": 1}})}
+    runner.run_in_image = run_in_image
+    shell = hs.HpcShell(remote=_hpc3_login(), home=str(tmp_path / "home"), artifacts_dir=str(artifacts),
+                        work_dir=str(work), workspace=hs.HpcWorkspace(read_roots=(str(hpc3),)))
+    return build_scientist_catalog(code_executor=runner, hpc_shell=shell), runner, table
+
+
+def _scripted(plan):
+    """A model that makes the calls ``plan(results)`` returns, one per turn, given the tool results it
+    has seen so far in this step."""
+    def chat(messages, tools):
+        seen = [m.get("content") or "" for m in messages if m.get("role") == "tool"]
+        name, args = plan(seen)
+        return {"content": "", "tool_calls": [{"id": f"c{len(seen)}", "type": "function",
+                                               "function": {"name": name, "arguments": json.dumps(args)}}]}
+    return chat
+
+
+def test_c3_reads_its_summary_tables_with_the_lookups_when_run_code_is_off(release, tmp_path, monkeypatch,
+                                                                          capsys):
+    """C3 on production (v0.4.25, run bff4c779876c) read summary_celltype.tsv with run_code, because
+    get_summary returns only the rows that fit. Replayed with model-written code off: run_code is not
+    offered and the call is refused; the model reads the table get_summary names with read_text, which
+    resolves it in the run's HPC3 artifacts where the collector put it, a page at a time, every page
+    seen whole, and the step ends with its answer."""
+    from aiscientist.agents import code_policy
+    from aiscientist.agents.research_harness import ResearchHarness
+    from aiscientist.hpc.shell import MAX_PAGE_CHARS
+
+    assert not code_policy.model_written_code()
+    catalog, runner, table = _c3_tools(release, tmp_path, monkeypatch, capsys)
+    names = {t.name for t in catalog}
+    assert not names & code_policy.WITHHELD_TOOLS
+    assert {"get_summary", "read_text", "stat_path", "list_dir"} <= names
+    assert len(json.dumps(table)) > 2 * MAX_PAGE_CHARS, "the table is longer than two pages"
+    ctx = HarnessContext(workspace=tmp_path)
+
+    query_calls = [("resolve_genes", {"genes": "LRAT, CRALBP, rho, ABCR"}),
+                   ("submit_query", {"genes": "LRAT,RLBP1,RHO,ABCA4"}),
+                   ("query_status", {"query_id": C3_QUERY}),
+                   ("finish", {"answer": f"Query {C3_QUERY} completed."})]
+    query = ResearchHarness(catalog=catalog, chat_fn=_scripted(lambda seen: query_calls[len(seen)])).run(
+        C3_QUERY_STEP, ctx)
+    assert query.final_answer == f"Query {C3_QUERY} completed." and not query.errors
+
+    final = "RLBP1 ranks Type_000 first (1.600 CP10k); the full table has 640 rows."
+
+    def summary_plan(seen):
+        if not seen:
+            return "get_summary", {"query_id": C3_QUERY, "level": "celltype", "top": 500}
+        if len(seen) == 1:
+            return REFUSED_READ          # what C3 did next
+        last = json.loads(seen[-1])
+        if len(seen) == 2:               # refused: read the table get_summary named, as it named it
+            return "read_text", {"path": json.loads(seen[0])["full_table"]}
+        if "next_offset" in last:
+            return "read_text", {"path": last["path"], "offset": last["next_offset"]}
+        if "exists" not in last:
+            return "stat_path", {"path": f"gene_expression/{C3_QUERY}/dotplot_majorclass.png"}
+        return "finish", {"answer": final}
+    fed: list[str] = []
+
+    def chat(messages, tools):
+        fed[:] = [m.get("content") or "" for m in messages if m.get("role") == "tool"]
+        return _scripted(summary_plan)(messages, tools)
+    summary = ResearchHarness(catalog=catalog, chat_fn=chat).run(C3_STEP, ctx)
+
+    assert runner.calls == ["resolve_genes", "submit_query", "query_status", "get_summary"], "no code ran"
+    shown = json.loads(fed[0])
+    assert shown["rows_omitted"] > 0 and shown["full_table"] == f"gene_expression/{C3_QUERY}/summary_celltype.tsv"
+    assert "get_summary with gene" in shown["rows_note"] and "read_text" in shown["rows_note"]
+    refusal = json.loads(fed[1])["error"]
+    assert "'run_code' is turned off on this deployment" in refusal and "read_text" in refusal
+    assert [e["tool"] for e in summary.errors] == ["run_code"]
+    pages = [json.loads(text) for text in fed[2:-1]]   # every page reached the model whole
+    assert len(pages) >= 3 and all("text" in page for page in pages)
+    assert "".join(page["text"] for page in pages) == table, "every row, the omitted ones included"
+    assert json.loads(fed[-1])["exists"] is True
+    assert summary.final_answer == final
+
+
+def test_a_model_that_keeps_calling_run_code_ends_the_step_on_the_result_it_has(release, tmp_path,
+                                                                                 monkeypatch, capsys):
+    """If the model does not switch to the lookups and asks for run_code again, the refusals count as
+    wasted turns: the step ends on the result get_summary already gave (``done_early``), after two of
+    them, instead of spending the step's whole budget on refusals."""
+    from aiscientist.agents.research_harness import ResearchHarness
+
+    catalog, runner, _ = _c3_tools(release, tmp_path, monkeypatch, capsys)
+    turns: list[int] = []
+
+    def plan(seen):
+        turns.append(len(seen))
+        return ("get_summary", {"query_id": C3_QUERY, "level": "celltype", "top": 500}) if not seen else REFUSED_READ
+    summary = ResearchHarness(catalog=catalog, chat_fn=_scripted(plan)).run(
+        C3_STEP, HarnessContext(workspace=tmp_path))
+    assert runner.calls == ["get_summary"]
+    assert summary.stop_reason == "done_early" and len(turns) == 3
+    assert [s["tool"] for s in summary.steps if s.get("ok")] == ["get_summary"]
+    assert C3_QUERY in summary.final_answer, "the step reports what get_summary returned"
+
+
+def test_the_same_refusal_three_times_ends_a_step_that_has_no_result_yet(tmp_path):
+    from aiscientist.agents.research_harness import ResearchHarness, default_catalog
+
+    turns: list[int] = []
+
+    def plan(seen):
+        turns.append(len(seen))
+        return REFUSED_READ
+    result = ResearchHarness(catalog=list(default_catalog()), chat_fn=_scripted(plan)).run(
+        C3_STEP, HarnessContext(workspace=tmp_path))
+    assert result.stop_reason == "repeated_tool_errors" and len(turns) == 3

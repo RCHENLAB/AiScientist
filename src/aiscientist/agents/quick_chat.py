@@ -86,6 +86,8 @@ QUICK_CHAT_SYSTEM = (
     "When a diagram genuinely helps explain a workflow, mechanism, or decision path, emit a "
     "```mermaid fenced block (flowchart TD / sequenceDiagram / graph LR). It renders inline in "
     "the chat. Keep it small — under ~12 nodes — and use it to clarify structure, not to decorate. "
+    "Do not draw an analysis plan or the steps of a run as a flow chart unless the user asks for one: "
+    "the console shows the plan and where each step stands on its own. "
     "Write every node label as plain, single-line text: no line breaks, no literal \\n, and no HTML "
     "tags (<br>, <b>, <i>) inside a label. The renderer draws labels as plain text for safety, so "
     "those show up as literal characters or break the diagram. Keep each label short and avoid "

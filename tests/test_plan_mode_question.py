@@ -17,6 +17,7 @@ import json
 
 from aiscientist.agents.research_harness import HarnessContext, ResearchHarness, default_catalog
 from aiscientist.agents.research_lab import LabConfig, ResearchLab, classify_plan_reply
+from plan_turns import instruction
 
 
 def test_english_questions_and_change_requests_are_told_apart():
@@ -66,7 +67,7 @@ def _lab(agenda, answer="Because the comparison is within one sample, the cell i
     seen: list[str] = []
 
     def complete(messages):
-        sys_prompt = messages[0]["content"]
+        sys_prompt = instruction(messages)
         seen.append(sys_prompt)
         if "answering a researcher's question about the analysis plan" in sys_prompt:
             return answer

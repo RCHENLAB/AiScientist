@@ -762,8 +762,8 @@ class SSHExecutor:
             span.end("fallback")
             return False
 
-    def read_bytes(self, remote_path: str, max_bytes: int | None = None) -> bytes:
-        """Read (at most ``max_bytes`` of) a remote file, over SFTP.
+    def read_bytes(self, remote_path: str, max_bytes: int | None = None, offset: int = 0) -> bytes:
+        """Read (at most ``max_bytes`` of) a remote file from byte ``offset``, over SFTP.
 
         Reading file CONTENT is a transfer, so it belongs on the transfer host next to
         put/get — not in a ``cat``/``head -c … | base64`` pipeline spawned on a login node.
@@ -780,12 +780,15 @@ class SSHExecutor:
             return b""      # as for any read that failed; a copy (put/get) fails with the reason
         try:
             with sftp.open(remote_path, "rb") as handle:
+                if offset > 0:
+                    handle.seek(offset)
                 if max_bytes is None:
                     handle.prefetch()
                     return handle.read()
                 # Prefetch EXACTLY the window asked for: an unbounded prefetch would try to pull
-                # a whole multi-GB VCF back for a 256 KB peek.
-                handle.prefetch(max_bytes)
+                # a whole multi-GB VCF back for a 256 KB peek. (``prefetch`` takes where the window
+                # ends, counting from the start of the file.)
+                handle.prefetch(max(0, offset) + max_bytes)
                 return handle.read(max_bytes)
         except (OSError, paramiko.SSHException):
             return b""

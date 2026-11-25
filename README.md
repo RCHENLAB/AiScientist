@@ -3,8 +3,10 @@
 AiScientist is a web research agent for biomedical data: single-cell RNA-seq, VCFs and clinical
 phenotypes. A researcher adds a dataset and asks a question in plain language. LLM roles then work
 as a small lab: the PI drafts a plan, the researcher reviews it, the Scientist runs each step with
-curated tools or its own code, the Critic checks every step, and the run ends in a cited,
-manuscript-style report (PDF and DOCX) with its figures and tables.
+tested tools, the Critic checks every step, and the run ends in a cited, manuscript-style report
+(PDF and DOCX) with its figures and tables. A step no tested tool or skill does is not run: the plan
+and the reply say it is not available, and the request is recorded for the team. Code the AI writes
+itself runs only where the deployment turns it on (`AISCIENTIST_MODEL_WRITTEN_CODE`).
 
 It is built for the UCI vision research lab and runs at <https://AiScientist.eye.som.uci.edu>. The
 site is open on the public internet. An account is registered with a `@uci.edu` email or created
@@ -70,7 +72,7 @@ The diagrams, the code layers and the tool routing are in
 | | What it is | Where |
 |---|---|---|
 | Tool | Fixed code the Scientist calls by name | [`src/aiscientist/tools/`](src/aiscientist/tools/README.md), one folder per tool |
-| Skill | A code template the Scientist adapts and runs | the pinned release of [`lijinbio/aiscientist-skills`](https://github.com/lijinbio/aiscientist-skills) ([`configs/skills_registry.json`](configs/skills_registry.json)) |
+| Skill | A method with its guidance and code: run through its own tools, or, where the deployment allows code the AI writes, a template the Scientist adapts and runs | the pinned release of [`lijinbio/aiscientist-skills`](https://github.com/lijinbio/aiscientist-skills) ([`configs/skills_registry.json`](configs/skills_registry.json)) |
 | Pipeline | An end-to-end protocol the PI picks when planning | [`preset_pipelines/`](preset_pipelines/README.md) |
 
 Adding one of these is adding a folder (a skill's goes into the registry). No platform code changes.
@@ -96,6 +98,9 @@ python3 -m pytest        # the test suite: offline, no cluster, .env or network 
 - **Production:** a systemd unit on the lab server behind the Envoy ingress. A deploy is a release
   tag on RCHENLAB/AiScientist, which the server installs itself. The runbook is
   [`deploy/README.md`](deploy/README.md).
+- **Docker and Kubernetes:** every release publishes the image `ghcr.io/rchenlab/aiscientist:<tag>`,
+  whose digest the release notes give. [`deploy/k8s/README.md`](deploy/k8s/README.md) runs it as one
+  pod, with PostgreSQL, a volume and the HPC3 access it needs, and covers upgrades and rollbacks.
 
 ## Plan resource estimates
 
@@ -148,6 +153,7 @@ tests/             the offline test suite
 - [`docs/hpc3_storage_layout.md`](docs/hpc3_storage_layout.md) and
   [`docs/hpc3_assets.md`](docs/hpc3_assets.md): what lives where on HPC3, and what is cleaned up.
 - [`deploy/README.md`](deploy/README.md): deploying and updating the server.
+- [`deploy/k8s/README.md`](deploy/k8s/README.md): running the released image on Kubernetes.
 - [`docs/claude_api_guide.md`](docs/claude_api_guide.md): using your Claude subscription's API
   credits with AiScientist, keeping the key safe, and watching what it spends.
 - [`docs/development/metadata.md`](docs/development/metadata.md): the metadata guideline, the

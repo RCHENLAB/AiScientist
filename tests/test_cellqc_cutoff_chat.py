@@ -18,6 +18,7 @@ pytest.importorskip("yaml")
 from aiscientist.agents.cellqc_cutoffs import cutoff_rows, read_cutoff_request  # noqa: E402
 from aiscientist.agents.research_harness import HarnessContext, HarnessTool, ResearchHarness  # noqa: E402
 from aiscientist.agents.research_lab import LabConfig, ResearchLab  # noqa: E402
+from plan_turns import instruction  # noqa: E402
 from aiscientist.reporting.qc_summary import QC_SUMMARY_POLICY, cutoff_lines, qc_result_summary  # noqa: E402
 
 QC = ("**CellQC** — Filter the barcodes with `mcp_run_cellqc`: drop barcodes with fewer than 500 counts, "
@@ -106,7 +107,7 @@ def _scientist_chat(messages, _tools):
 
 def _complete(counts: dict, revise_reply: str = '{"ops": []}'):
     def complete(messages):
-        system = messages[0]["content"]
+        system = instruction(messages)
         if "Principal Investigator of a bioinformatics lab" in system:
             counts["plan"] = counts.get("plan", 0) + 1
             return json.dumps({"agenda": [QC, CLUSTER]})
@@ -394,7 +395,7 @@ def test_a_cutoff_no_step_takes_goes_to_the_reviser_on_a_scanpy_plan():
     complete = lab._complete_fn
 
     def scanpy_complete(messages, **kw):
-        if "Principal Investigator of a bioinformatics lab" in messages[0]["content"]:
+        if "Principal Investigator of a bioinformatics lab" in instruction(messages):
             counts["plan"] = counts.get("plan", 0) + 1
             return json.dumps({"agenda": [SCANPY, CLUSTER]})
         return complete(messages)

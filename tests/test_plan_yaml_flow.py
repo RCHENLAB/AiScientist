@@ -23,6 +23,7 @@ pytest.importorskip("yaml")
 
 from aiscientist.agents.research_harness import HarnessContext, HarnessTool, ResearchHarness  # noqa: E402
 from aiscientist.agents.research_lab import LabConfig, ResearchLab  # noqa: E402
+from plan_turns import body, instruction, turn  # noqa: E402
 
 QC = ("**QC & normalization** — Measure each cell's quality with `mcp_run_scanpy_qc` and remove cells "
       "detecting fewer than 200 genes and cells whose reads are more than 10% mitochondrial.")
@@ -64,7 +65,7 @@ def _scientist_chat(messages, _tools):
 
 def _complete(counts: dict):
     def complete(messages):
-        system = messages[0]["content"]
+        system = instruction(messages)
         if "Principal Investigator of a bioinformatics lab" in system:
             counts["plan"] = counts.get("plan", 0) + 1
             return json.dumps({"agenda": AGENDA})
@@ -270,10 +271,10 @@ def _complete_revising(counts: dict, revise_reply: str):
     base = _complete(counts)
 
     def complete(messages):
-        system = messages[0]["content"]
+        system = instruction(messages)
         if "changing an analysis plan" in system:
             counts["revise"] = counts.get("revise", 0) + 1
-            assert "```yaml" in messages[1]["content"] and "id: s2" in messages[1]["content"], \
+            assert "```yaml" in body(messages) and "id: s2" in body(messages), \
                 "the reviser is shown the plan document itself"
             return revise_reply
         if "filling in a form" in system:
@@ -382,7 +383,8 @@ def _recording(lab: ResearchLab, prompts: list) -> ResearchLab:
     inner = lab._complete_fn
 
     def complete(messages):
-        prompts.append((messages[0]["content"][:60], "\n".join(m["content"] for m in messages[1:])))
+        prompts.append((instruction(messages)[:60],
+                        turn(messages) or "\n".join(m["content"] for m in messages[1:])))
         return inner(messages)
     lab._complete_fn = complete
     return lab

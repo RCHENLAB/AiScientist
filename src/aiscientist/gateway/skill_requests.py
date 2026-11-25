@@ -1,5 +1,9 @@
 """Skill requests: runs that needed code the model wrote, kept for the team (issue 13).
 
+While the deployment runs no model-written code (``AISCIENTIST_MODEL_WRITTEN_CODE`` off, issue 150),
+such a step does not run at all: the plan reports it as not available, and the run is recorded here
+with each of those steps and the closest skill the agent named for it (``not_available``).
+
 A run whose steps called ``run_code``, ``run_shell`` or ``run_in_environment`` asked for something no
 tested tool did. Instead of refusing such a request, the run goes ahead, the reply says which results
 came from untested code (``agents/code_provenance.py``), and the run leaves a record here: the
@@ -128,15 +132,22 @@ def _scrub_steps(steps: "list[dict[str, Any]]") -> "list[dict[str, Any]]":
     return out
 
 
+def _scrub_unavailable(rows: "list[dict[str, Any]]") -> "list[dict[str, Any]]":
+    keys = ("step", "skill", "does", "lacks", "needs")
+    return [{k: scrub(r[k])[:1000] for k in keys if r.get(k)} for r in rows if isinstance(r, dict)][:20]
+
+
 def build_record(*, run_id: str, account: str, question: str, provenance: dict[str, Any],
                  conversation_id: str = "", earlier_requests: "list[str] | None" = None,
                  datasets: "list[dict[str, Any]] | None" = None,
                  pipelines: "list[str] | None" = None, skills: "list[str] | None" = None,
                  converged: bool = False,
                  claim_audit: "dict[str, Any] | None" = None,
-                 induced_skills: "list[str] | None" = None) -> dict[str, Any]:
+                 induced_skills: "list[str] | None" = None,
+                 not_available: "list[dict[str, Any]] | None" = None) -> dict[str, Any]:
     """One run's skill request, scrubbed and ready to save. ``provenance`` is
-    :func:`agents.code_provenance.run_provenance` of the run's rounds."""
+    :func:`agents.code_provenance.run_provenance` of the run's rounds; ``not_available`` the plan
+    steps that did not run because no tested tool or skill does them (``NotAvailable.to_dict()``)."""
     audit = claim_audit or {}
     claims = audit.get("claims") if isinstance(audit.get("claims"), list) else []
     return {
@@ -161,8 +172,10 @@ def build_record(*, run_id: str, account: str, question: str, provenance: dict[s
             "code_failures": sum(1 for s in provenance.get("steps") or []
                                  for c in s.get("code_calls") or [] if not c.get("ok")),
             "claims_checked": len(claims),
+            "not_available": len(not_available or []),
         },
         "steps": _scrub_steps(provenance.get("steps") or []),
+        "not_available": _scrub_unavailable(not_available or []),
         "induced_skills": [str(n) for n in (induced_skills or [])],
         "summary": {},
         "summary_by": "",
@@ -174,8 +187,10 @@ def build_record(*, run_id: str, account: str, question: str, provenance: dict[s
 
 _SUMMARY_SYSTEM = (
     "You summarize one request made to AiScientist, a single-cell and variant analysis platform, "
-    "for the team that decides which tested skills to build next. The run went ahead with code the "
-    "AI wrote itself; you are told what that code did and how it went. Reply with ONE JSON object "
+    "for the team that decides which tested skills to build next. Either the run went ahead with "
+    "code the AI wrote itself, and you are told what that code did and how it went, or the steps no "
+    "tested tool or skill does did not run (steps_not_available, with the closest skill the agent "
+    "named). Reply with ONE JSON object "
     "and nothing else, with these keys:\n"
     '  "one_line": the request in one plain sentence, as the user would confirm it;\n'
     '  "goal": what the user wants to find out;\n'
@@ -204,7 +219,10 @@ def _summary_payload(rec: dict[str, Any], choices: "list[str]") -> str:
         "request": rec.get("request", ""), "earlier_requests": rec.get("earlier_requests", []),
         "datasets": rec.get("datasets", []), "pipelines_used": rec.get("pipelines", []),
         "skills_used": rec.get("skills", []),
-        "steps_that_needed_code": steps[:8], "existing_pipelines_skills_and_tools": choices[:120],
+        "steps_that_needed_code": steps[:8],
+        "steps_not_available": [{k: r.get(k, "") for k in ("step", "skill", "lacks", "needs")}
+                                for r in rec.get("not_available") or []][:8],
+        "existing_pipelines_skills_and_tools": choices[:120],
     }, ensure_ascii=False)
 
 
@@ -219,9 +237,16 @@ def fallback_summary(rec: dict[str, Any]) -> dict[str, Any]:
                           for d in rec.get("datasets") or []} - {""}),
         "outputs": sorted({Path(f).suffix.lstrip(".") or f for f in files})[:10],
         "methods": [], "category": "other",
-        "closest_skill": ([*(rec.get("pipelines") or []), *(rec.get("skills") or [])] or [""])[0],
-        "missing": "",
+        "closest_skill": (_named_closest(rec) or [*(rec.get("pipelines") or []),
+                                                  *(rec.get("skills") or [])] or [""])[0],
+        "missing": next((str(r.get("lacks") or "") for r in rec.get("not_available") or []
+                         if r.get("lacks")), ""),
     }
+
+
+def _named_closest(rec: dict[str, Any]) -> "list[str]":
+    """The closest skills the agent named for the steps that were not available, in plan order."""
+    return [str(r["skill"]) for r in rec.get("not_available") or [] if r.get("skill")]
 
 
 def _clean_summary(obj: dict[str, Any], choices: "list[str]") -> dict[str, Any]:
@@ -255,7 +280,12 @@ def summarize(rec: dict[str, Any], complete_fn: "Callable[..., str] | None",
                                 role="classify")
             obj = safe_json_loads(_json_block(reply))
             if obj:
-                return _clean_summary(obj, choices), "model"
+                summary = _clean_summary(obj, choices)
+                # The step that did not run is recorded with the closest skill the agent named.
+                named = _named_closest(rec)
+                if named and not summary["closest_skill"]:
+                    summary["closest_skill"] = named[0]
+                return summary, "model"
         except Exception as exc:  # noqa: BLE001 - the record matters more than its summary
             print(f"[skill_requests] summary failed: {type(exc).__name__}: {exc}")
     return fallback_summary(rec), "code"
@@ -289,6 +319,20 @@ def save(rec: dict[str, Any]) -> Path:
         json.dump(rec, fh, ensure_ascii=False, indent=2)
     os.replace(tmp, path)
     return path
+
+
+def withdraw(rid: str) -> bool:
+    """Take back the record a run saved when its plan held a step (#150), once a redraft of that plan
+    holds none. Only a record nobody has handled yet and that holds no code is removed: one the team
+    moved on, or one with code the run wrote, stays. True when it was removed."""
+    rec = load(rid)
+    if rec is None or rec.get("status") != "new" or rec.get("status_history") or rec.get("steps"):
+        return False
+    try:
+        _path(rid).unlink()
+    except (KeyError, OSError):
+        return False
+    return True
 
 
 def apply_retention(rec: dict[str, Any], *, now: "datetime | None" = None,
@@ -341,6 +385,7 @@ def _row(rec: dict[str, Any]) -> dict[str, Any]:
         "outcome": rec.get("outcome") or {}, "induced_skills": rec.get("induced_skills") or [],
         "untested_steps": [s.get("step") for s in rec.get("steps") or []
                            if s.get("status") == "untested" and s.get("accepted")][:6],
+        "not_available_steps": [r.get("step") for r in rec.get("not_available") or []][:6],
         "raw_expired": bool(rec.get("raw_expired")),
     }
 

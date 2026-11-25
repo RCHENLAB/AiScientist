@@ -235,6 +235,11 @@ class LabConfig:
     # the finished run is read back against the approved plan. Off = the prose agenda alone: nothing
     # binds a tool to the number on the plan card. The gateway turns it on unless AISCIENTIST_PLAN_YAML=0.
     plan_yaml: bool = False
+    # The plan phase as ONE append-only conversation with the PI (RCHENLAB/AiScientist#122): the draft,
+    # the review's PI round and every reply's reading, answer and revision are turns after one fixed
+    # prefix, so each turn after the first reads that prefix from the cache. Off = each of them a call
+    # of its own, as before.
+    plan_conversation: bool = True
     # Hypothesis-driven exploration — the ONLY path by which the plan GROWS mid-run. Off = today's
     # behaviour exactly: the agenda drafted before any data is seen can be skipped/amended/pruned but
     # never extended, so the run can only ever execute the paths it started with. On: after a step is
@@ -430,6 +435,10 @@ class LabResult:
     # The approved plan had a ``write_report`` step (#102): the gateway writes the report after the
     # analysis. False: the run ends with its answer in the chat.
     report_requested: bool = False
+    # The plan steps that did not run because no tested tool or skill does them, while the deployment
+    # runs no model-written code (code_gate.py): ``NotAvailable.to_dict()`` rows, for the reply and
+    # the skill request (RCHENLAB/AiScientist#150).
+    unavailable_steps: list[dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -444,6 +453,7 @@ class LabResult:
             "claim_audit": dict(self.claim_audit),
             "skipped_steps": list(self.skipped_steps),
             "report_requested": self.report_requested,
+            "unavailable_steps": [dict(r) for r in self.unavailable_steps],
         }
 
     @classmethod
@@ -458,6 +468,7 @@ class LabResult:
             dict(d.get("claim_audit") or {}),
             [str(s) for s in (d.get("skipped_steps") or []) if str(s).strip()],
             bool(d.get("report_requested", False)),
+            [dict(r) for r in (d.get("unavailable_steps") or []) if isinstance(r, dict)],
         )
 
 

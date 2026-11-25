@@ -2,7 +2,9 @@ name: Release
 
 # Build a runtime-only app package when a version tag is pushed, and attach it to a GitHub Release
 # together with SHA256SUMS. The Eye Server's deploy timer finds the new release and installs it with
-# deploy/deploy_release.sh (deploy/README.md).
+# deploy/deploy_release.sh (deploy/README.md). Then build the service image from that package, test
+# it, publish it at ghcr.io/rchenlab/aiscientist and name its digest in the release notes
+# (deploy/k8s/README.md). The image job never holds up the package: the server deploys without it.
 
 on:
   push:
@@ -44,3 +46,107 @@ jobs:
           gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" --verify-tag --generate-notes --title "$TAG" "${PRE[@]}"
           if [ ${#PRE[@]} -gt 0 ]; then gh release edit "$TAG" --prerelease; fi
           gh release upload "$TAG" "dist/aiscientist-${TAG}.tar.gz" dist/SHA256SUMS --clobber
+
+  image:
+    name: Build, test and publish the service image
+    needs: package
+    if: github.repository == 'RCHENLAB/AiScientist'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write    # the release notes
+      packages: write    # ghcr.io/rchenlab/aiscientist
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      TAG: ${{ github.ref_name }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Sign in to GitHub's container registry
+        run: |
+          set -euo pipefail
+          echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/aiscientist" >> "$GITHUB_ENV"
+          echo "$GH_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+
+      # A published tag is never replaced: a re-run (after the package was made public, say) keeps
+      # the image and the digest the release already has, and only repeats the checks below.
+      - name: Is this tag's image published already?
+        id: existing
+        run: |
+          set -euo pipefail
+          if digest="$(docker buildx imagetools inspect "$IMAGE:$TAG" 2>/dev/null | awk '/^Digest:/ {print $2; exit}')" \
+             && [ -n "$digest" ]; then
+            echo "$IMAGE:$TAG is published already ($digest): not built again"
+            echo "digest=$digest" >> "$GITHUB_OUTPUT"
+          fi
+
+      # The image is built from the package the release carries, checked against its SHA256SUMS.
+      - name: Build the image from the release package
+        if: steps.existing.outputs.digest == ''
+        run: |
+          set -euo pipefail
+          gh release download "$TAG" -p "aiscientist-$TAG.tar.gz" -p SHA256SUMS -D dist
+          deploy/build_image.sh "$TAG" dist "$IMAGE:$TAG"
+
+      # With PostgreSQL and an empty volume: /health names the tag with accounts on and the pinned
+      # skills release, the console answers, the database is migrated, a restart keeps the state.
+      - name: Smoke-test the image
+        if: steps.existing.outputs.digest == ''
+        run: deploy/smoke_test_image.sh "$IMAGE:$TAG" "$TAG"
+
+      - name: Publish the image
+        if: steps.existing.outputs.digest == ''
+        run: docker push "$IMAGE:$TAG"
+
+      - name: Read the published digest
+        id: digest
+        run: |
+          set -euo pipefail
+          digest="$(docker buildx imagetools inspect "$IMAGE:$TAG" | awk '/^Digest:/ {print $2; exit}')"
+          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "::error::no digest for $IMAGE:$TAG"; exit 1; }
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+          echo "$IMAGE@$digest"
+
+      # Operators pull without registry credentials. A new package on GHCR is private: an owner of
+      # the organisation makes it public once (Package settings, Change visibility), then re-runs
+      # this job.
+      - name: Check that the image can be pulled without credentials
+        env:
+          DIGEST: ${{ steps.digest.outputs.digest }}
+        run: |
+          set -euo pipefail
+          repo="${IMAGE#ghcr.io/}"
+          token="$(curl -fsS "https://ghcr.io/token?scope=repository:$repo:pull" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("token", ""))')" || token=""
+          if ! curl -fsS -o /dev/null -H "Authorization: Bearer $token" \
+               -H "Accept: application/vnd.oci.image.index.v1+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json" \
+               "https://ghcr.io/v2/$repo/manifests/$DIGEST"; then
+            echo "::error::$IMAGE is not public: an organisation owner sets it to public at https://github.com/orgs/${GITHUB_REPOSITORY_OWNER}/packages/container/package/aiscientist (Package settings > Change visibility), then re-runs this job"
+            exit 1
+          fi
+          echo "$IMAGE@$DIGEST can be pulled without credentials"
+
+      - name: Name the image in the release notes
+        env:
+          DIGEST: ${{ steps.digest.outputs.digest }}
+        run: |
+          set -euo pipefail
+          gh release view "$TAG" --json body -q .body > notes.md
+          python3 - notes.md <<'PY'
+          import os, re, sys
+          path = sys.argv[1]
+          image, tag, digest = os.environ["IMAGE"], os.environ["TAG"], os.environ["DIGEST"]
+          repo = os.environ["GITHUB_REPOSITORY"]
+          section = (
+              "<!-- container-image -->\n"
+              "## Container image\n\n"
+              f"```bash\ndocker pull {image}:{tag}\n```\n\n"
+              f"Digest: `{image}@{digest}`. Pin the digest in a deployment: "
+              f"[Running AiScientist on Kubernetes](https://github.com/{repo}/blob/{tag}/deploy/k8s/README.md).\n"
+              "<!-- /container-image -->\n"
+          )
+          body = open(path, encoding="utf-8").read()
+          body = re.sub(r"\n*<!-- container-image -->.*?<!-- /container-image -->\n?", "", body, flags=re.S).rstrip()
+          open(path, "w", encoding="utf-8").write((body + "\n\n" if body else "") + section)
+          PY
+          gh release edit "$TAG" --notes-file notes.md

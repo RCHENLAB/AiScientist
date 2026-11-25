@@ -614,10 +614,32 @@ class AnalysisAdapter:
         if dataset:
             attached.append((PurePosixPath(dataset).name, dataset))
 
+        folders = [p.rstrip("/") for p in dict.fromkeys([root, *(str(row["path"]) for row in inputs)]) if p]
+
+        def inside_hint(value) -> str:
+            # A path INSIDE a bound folder is not an input of its own. Run 6e5a33230a46 bound one
+            # parent folder of three Cell Ranger libraries and sent each library's folder: every call
+            # failed with the bare refusal. Say what the call should be instead, naming the folders
+            # by their last component only.
+            text = str(value or "").rstrip("/")
+            for env in ("${AISCIENTIST_DATASET_ROOT}", "$AISCIENTIST_DATASET_ROOT"):
+                if root and text.startswith(env + "/"):
+                    text = root.rstrip("/") + text[len(env):]
+            parent = next((f for f in folders if text.startswith(f + "/")), None)
+            if parent is None:
+                return ""
+            hint = (f" ({PurePosixPath(text).name} is inside the bound folder {PurePosixPath(parent).name}, "
+                    "which the call already reads: leave `dataset` and `dataset_paths` out")
+            if self.server.name == "cellqc":
+                hint += ("; one run_cellqc call QCs every library of the bound folders, each species "
+                         "on its own, and `samples` chooses libraries")
+            return hint + ")"
+
         def bind(value):
             matches = {path for alias, path in attached if alias and value == alias and path}
             if len(matches) != 1:
-                raise ValueError("input path must identify exactly one attached dataset or input")
+                raise ValueError("input path must identify exactly one attached dataset or input"
+                                 + inside_hint(value))
             return matches.pop()
 
         values = setting_values(self.server)

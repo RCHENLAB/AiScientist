@@ -613,7 +613,7 @@ button.small { padding: 6px 12px; font-size: 12px; }
 .plan-entry .plan-head { padding: 13px 18px 12px; }
 .plan-entry .plan-note { margin: 10px 18px 0; }
 .plan-entry-steps { list-style: none; margin: 0; padding: 9px 18px 9px; display: flex; flex-direction: column; gap: 1px; }
-.plan-entry-step { display: flex; align-items: center; gap: 10px; min-height: 28px; }
+.plan-entry-step { display: flex; align-items: center; flex-wrap: wrap; gap: 3px 10px; min-height: 28px; }
 .plan-entry-num {
   flex: none; width: 20px; height: 20px; border-radius: 50%; display: grid; place-items: center;
   font-size: 11px; font-weight: 650; font-variant-numeric: tabular-nums; color: var(--text-secondary);
@@ -621,12 +621,50 @@ button.small { padding: 6px 12px; font-size: 12px; }
 }
 .plan-entry-step.revised .plan-entry-num { color: #7a4a05; background: rgba(232, 147, 12, 0.14); box-shadow: inset 0 0 0 1px rgba(232, 147, 12, 0.55); }
 .plan-entry-title {
-  flex: 1; min-width: 0; font-size: 13.5px; font-weight: 550; color: var(--text);
+  /* Keeps room for the title: on a narrow chat the tools and the step's mark move to a second line. */
+  flex: 1 1 11em; min-width: 0; font-size: 13.5px; font-weight: 550; color: var(--text);
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
+/* Where each step stands once the plan runs (RCHENLAB/AiScientist#121), on the chat's entry and on
+   the side panel's card alike: processing is tinted, with a label and a turning ring; done turns its
+   number into a check; failed, skipped and stopped carry a label. Before the run: no mark at all. */
+.plan-state {
+  flex: none; display: inline-flex; align-items: center; gap: 5px; padding: 0 8px 0 7px;
+  border-radius: 999px; font-size: 11.5px; line-height: 19px; font-weight: 550; white-space: nowrap;
+  background: var(--surface-sunken); color: var(--text-tertiary);
+}
+.plan-state.processing { background: rgba(var(--accent-rgb), 0.12); color: var(--accent-press); }
+.plan-state.failed { background: rgba(224, 70, 59, 0.1); color: var(--red-text); }
+.plan-state.stopped { color: var(--amber-text); background: rgba(232, 147, 12, 0.11); }
+.plan-state.skipped, .plan-state.pending { font-weight: 500; }
+.step-spin {
+  flex: none; width: 10px; height: 10px; border-radius: 50%; box-sizing: border-box;
+  border: 2px solid rgba(var(--accent-rgb), 0.25); border-top-color: var(--accent);
+  animation: step-spin 0.9s linear infinite;
+}
+@keyframes step-spin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) { .step-spin { animation-duration: 2.4s; } }
+.plan-entry-step.st-processing { margin: 0 -8px; padding: 0 8px; border-radius: 8px; background: rgba(var(--accent-rgb), 0.06); }
+.plan-entry-step.st-processing .plan-entry-num, .plan-step.st-processing .plan-step-num {
+  color: var(--accent-press); background: rgba(var(--accent-rgb), 0.12); box-shadow: inset 0 0 0 1.5px var(--accent);
+}
+.plan-entry-step.st-done .plan-entry-num, .plan-step.st-done .plan-step-num {
+  color: var(--green-text); background: rgba(52, 168, 83, 0.13); box-shadow: inset 0 0 0 1px rgba(52, 168, 83, 0.45);
+}
+.plan-entry-step.st-done .plan-entry-num .msym { font-size: 14px; font-weight: 700; }
+.plan-step.st-done .plan-step-num .msym { font-size: 15px; font-weight: 700; }
+.plan-entry-step.st-failed .plan-entry-num, .plan-step.st-failed .plan-step-num {
+  color: var(--red-text); background: rgba(224, 70, 59, 0.1); box-shadow: inset 0 0 0 1px rgba(224, 70, 59, 0.4);
+}
+.plan-entry-step.st-skipped .plan-entry-title, .plan-step.st-skipped .plan-step-title { color: var(--text-tertiary); text-decoration: line-through; }
+.plan-step-flag.added { color: var(--text-secondary); background: var(--surface-sunken); }
+.plan-entry-step.added .plan-entry-title { font-style: italic; }
 .plan-entry .plan-actions-row { padding: 11px 18px 13px; }
 .plan-entry .plan-actions-row .plan-actions-status { margin-right: auto; }
 .plan-note.bad { color: #7a2d1c; background: rgba(224, 70, 59, 0.08); box-shadow: inset 0 0 0 1px rgba(224, 70, 59, 0.30); }
+.plan-note.unavailable { align-items: flex-start; line-height: 1.45; }
+.plan-note.unavailable .msym { margin-top: 1px; }
+.plan-note.unavailable code { font-size: 11.5px; }
 .plan-actions-row button .msym { font-size: 17px; margin: -2px 4px -2px -2px; vertical-align: -3px; }
 
 /* ---- the side panel: Plan | Results ---- */
@@ -670,6 +708,11 @@ button.small { padding: 6px 12px; font-size: 12px; }
 }
 .plan-step-skill .msym { font-size: 14px; }
 .plan-entry-step .plan-step-skill { margin-left: 6px; }
+/* The data a step reads: name, version and file, each editable in place while the plan waits. */
+.plan-step-dataset { color: var(--text); flex-wrap: wrap; }
+.plan-dataset-part.editable { cursor: pointer; border-bottom: 1px dashed var(--border-strong, var(--border)); }
+.plan-dataset-part.editable:hover, .plan-dataset-part.editable:focus-visible { color: var(--accent, var(--text)); outline: none; }
+.plan-dataset-sep { color: var(--text-secondary); }
 /* The outputs a step is expected to leave (its skill's, or its tool's under the pipeline). */
 .plan-step-outputs { margin-top: 8px; padding: 7px 10px; border-radius: 9px; background: var(--surface-sunken); box-shadow: inset 0 0 0 1px var(--border); }
 .plan-outputs-head { display: flex; align-items: center; gap: 5px; font-size: 11.5px; font-weight: 600; color: var(--text-secondary); }
@@ -1376,6 +1419,33 @@ button.full { width: 100%; margin-top: 6px; }
 .msg.assistant .job-none, .msg.assistant .job-model { font-size: 12.5px; color: var(--text-tertiary); }
 .msg.assistant .job-model { display: flex; align-items: center; gap: 5px; margin-top: 6px; }
 .msg.assistant .job-model .msym { font-size: 15px; }
+/* The top of the opened run card (#121): the step running now, its Slurm job, and the command. */
+.msg.assistant .run-now-sec[hidden] { display: none; }
+.msg.assistant .now-step {
+  display: flex; flex-direction: column; gap: 6px; padding: 8px 10px; border-radius: 10px;
+  background: rgba(var(--accent-rgb), 0.05); border: 1px solid rgba(var(--accent-rgb), 0.22);
+}
+.msg.assistant .now-step + .now-step { margin-top: 6px; }
+.msg.assistant .now-head { display: flex; align-items: center; gap: 7px; min-width: 0; font-weight: 600; color: var(--text); }
+.msg.assistant .now-title { min-width: 0; overflow-wrap: anywhere; }
+.msg.assistant .now-why { font-weight: 400; font-size: 12px; color: var(--text-tertiary); }
+.msg.assistant .now-job:empty { display: none; }
+.msg.assistant .now-cmd-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; font-size: 12.5px; color: var(--text-secondary); }
+.msg.assistant .now-cmd-words { min-width: 0; overflow-wrap: anywhere; }
+.msg.assistant .now-cmd-state { font-size: 11.5px; padding: 0 7px; border-radius: 999px; background: var(--surface-sunken); }
+.msg.assistant .now-cmd-state.running { background: rgba(var(--accent-rgb), 0.12); color: var(--accent-press); }
+.msg.assistant .now-cmd-state.done { color: var(--green-text); }
+.msg.assistant .now-cmd-state.failed { color: var(--red-text); }
+.msg.assistant .now-copy { margin-left: auto; display: inline-flex; align-items: center; gap: 4px; padding: 2px 9px; font-size: 12px; }
+.msg.assistant .now-copy .msym { font-size: 15px; }
+.msg.assistant .now-code {
+  margin: 0; padding: 9px 11px; max-height: 320px; overflow: auto; border-radius: 8px;
+  background: var(--surface-reading); border: 1px solid var(--border);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11.5px; line-height: 1.45;
+  white-space: pre; color: var(--text); user-select: text;
+}
+.msg.assistant .now-code[hidden] { display: none; }
+.msg.assistant .now-code code { display: block; padding: 0; background: none; border: 0; border-radius: 0; font: inherit; color: inherit; }
 @keyframes working-pulse {
   0%, 100% { opacity: 0.35; transform: scale(0.85); }
   50%      { opacity: 1;    transform: scale(1.1); }

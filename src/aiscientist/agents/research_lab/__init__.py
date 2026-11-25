@@ -49,6 +49,7 @@ from .. import claim_audit
 from ..dag import LabPlan, TaskNode, lift_agenda_to_dag, parse_dag
 from ..cellqc_cutoffs import CUTOFFS as CUTOFF_SETTINGS, cutoff_rows, read_cutoffs
 from ..hypotheses import DesignFacts, HypothesisLedger
+from ..code_policy import model_written_code, planning_note
 from ..loop_utils import safe_json_loads
 from ..tool_schema import REPORT_TOOL, PlanParameters
 from ..plan_doc import (
@@ -71,6 +72,10 @@ from ..plan_doc import (
 from ..tool_names import canonical_tool_name
 from ..scope import RunScope, lookup_only_run, qc_only_run, read_scope, rules_out_report, wants_written_report
 from .. import own_choices
+from .. import plan_datasets
+from ..plan_conversation import PlanConversation
+from ..plan_reply import (ReplyReading, copies_reply, fallback_reading, lookup_about_data, parse_reading,
+                          reply_prompt)
 from ..preset_pipelines import (
     PresetPipeline,
     compose_pipeline_prompts,
@@ -120,6 +125,7 @@ from .prompts import (  # noqa: F401
     _EXPLORE_SYSTEM,
     _LIT_QUERY_SYSTEM,
     _MEETING_CRITIC_SYSTEM,
+    _MEETING_EXPERT_SYSTEM,
     _MEETING_SYNTH_SYSTEM,
     _MODE_ROUTE_SYSTEM,
     _NEXT_CYCLE_SYSTEM,
@@ -130,6 +136,7 @@ from .prompts import (  # noqa: F401
     _PLAN_PATCH_SYSTEM,
     _PLAN_QA_SYSTEM,
     _PLAN_REFORMAT,
+    _PLAN_REPLY_SYSTEM,
     _PLAN_REVIEW_CRITIC_SYSTEM,
     _PLAN_REVIEW_PI_SYSTEM,
     _PLAN_REVISE_SYSTEM,
@@ -144,6 +151,7 @@ from .prompts import (  # noqa: F401
     _TEAM_FORM_SYSTEM,
     plan_skills_block,
 )
+from . import code_gate
 from .models import (  # noqa: F401
     CRITIC_SCORE_BANDS,
     CodeExecutor,
@@ -223,6 +231,7 @@ from .tooling import (  # noqa: F401
     check_plan_tooling,
     make_run_code_tool,
     make_run_in_environment_tool,
+    per_library_settings,
     plan_tool_contracts,
     retick_tools,
 )
@@ -361,6 +370,9 @@ _MAX_FAILURE_FORKS = 2
 # headless mode. Being asked a fourth time is not more control; it is the same question again from
 # a run that has already shown it cannot answer it.
 _MAX_HUMAN_FAILURE_ASKS = 3
+# The decision point's option that ends the run. The gateway treats an answer naming it as Stop,
+# so it ends the run even when it arrives after the card stopped waiting.
+ABORT_RUN_OPTION = "Abort the run"
 
 
 #: Below this a "describe" answer keeps the design meeting.
@@ -390,7 +402,69 @@ _PLAN_FINDING_WORDS = {
     "unknown_setting": "step {step}: `{tool}` has no setting `{param}` (it takes: {detail})",
     "bad_value": "step {step}: `{tool}` cannot take {param} = {detail}",
     "unknown_skill": "step {step} names the skill `{param}`, which is not in this deployment's skill library",
+    "unknown_dataset": "step {step}: {detail}",
 }
+
+# Words that make a question about the plan one about its data: the answer is then given the datasets
+# the researcher can use (RCHENLAB/AiScientist#120).
+_DATA_QUESTION_WORDS = ("dataset", "data set", " data", "file", "version", "atlas", "sample",
+                        "数据", "文件", "版本", "图谱", "样本")
+
+
+def _mentions_data(text: str) -> bool:
+    low = f" {(text or '').lower()}"
+    return any(w in low for w in _DATA_QUESTION_WORDS)
+
+
+def _drafted_steps(raw: "str | None", key: str = "agenda") -> "dict[str, dict[str, Any]]":
+    """The PI's structured steps (RCHENLAB/AiScientist#122): ``{step text: {"tool", "settings",
+    "skill"}}`` from a reply's ``plan_steps``, one object per item of its ``key`` list in the same order.
+    ``{}`` when the reply has none, or a list of another length (nothing can be matched then). Keyed by
+    the step's text with its whitespace folded, as ``_drafted_entry`` looks it up."""
+    obj = _parse_verdict(raw or "")
+    if not isinstance(obj, dict):
+        return {}
+    texts, rows = obj.get(key), obj.get("plan_steps")
+    if not isinstance(texts, list) or not isinstance(rows, list) or len(texts) != len(rows):
+        return {}
+    out: dict[str, dict[str, Any]] = {}
+    for text, row in zip(texts, rows):
+        if not isinstance(text, str) or not isinstance(row, dict):
+            continue
+        entry: dict[str, Any] = {}
+        tool = row.get("tool")
+        if isinstance(tool, str) and tool.strip().strip("`"):
+            entry["tool"] = tool.strip().strip("`")
+        if isinstance(row.get("settings"), dict):
+            entry["settings"] = dict(row["settings"])
+        if "skill" in row:
+            skill = row.get("skill")
+            entry["skill"] = skill.strip().strip("`") if isinstance(skill, str) and skill.strip() else None
+        out[" ".join(text.split())] = entry
+    return out
+
+
+def _planner_tool_settings(tool: Any) -> str:
+    """The settings a tool takes, for the draft's tool list, so the PI can name a step's settings in
+    its structured steps: ``' Settings: min_genes (integer), flavor (string: seurat/cell_ranger)'``."""
+    props = (getattr(tool, "parameters", None) or {}).get("properties") or {}
+    bits = []
+    for name, spec in list(props.items())[:24]:
+        if not isinstance(spec, dict):
+            continue
+        kind = str(spec.get("type") or "any")
+        if spec.get("enum"):
+            kind += ": " + "/".join(map(str, spec["enum"][:8]))
+        bits.append(f"{name} ({kind})")
+    return (" Settings: " + ", ".join(bits) + ".") if bits else ""
+
+
+def _cannot_reason(raw: "str | None") -> str:
+    """The reviser's ``{"cannot": "..."}``: why it could not carry the request out, ``''`` otherwise."""
+    obj = _parse_verdict(raw or "")
+    reason = obj.get("cannot") if isinstance(obj, dict) else None
+    text = " ".join(str(reason or "").split())
+    return text[:600] if text and not (isinstance(obj, dict) and obj.get("ops")) else ""
 
 
 #: How much of an assigned skill's SKILL.md and code goes into a step's brief; the rest stays one
@@ -419,7 +493,9 @@ def _assigned_skill_block(skill: "Skill") -> str:
     where = (f"registry release {skill.registry_release}" if skill.registry_release
              else "a skill learned by this deployment")
     run = ("run its commands with run_in_environment" if skill.image
-           else "run the code with run_code")
+           else "run the code with run_code") if model_written_code() else (
+        "carry it out with the step's tools: this deployment runs no code you write, so the skill's "
+        "code is guidance only")
     out = [f"The approved plan assigns the skill `{skill.name}` (version {skill.version or 'local'}, "
            f"{where}) to this step. Its guidance and code are below: carry out the step WITH this "
            "skill. Adapt only what it marks for adaptation (this dataset's paths, columns, groups and "
@@ -455,6 +531,13 @@ def _skill_name(name: str) -> "str | None":
 #: AND 15 on one step, both ending on ``max_steps``, both marked revise. Escalation applies only
 #: to the budget stop — more turns cannot help a model stuck on repeated errors.
 RETRY_TURN_BONUS = 4
+
+
+def _node_index(node: TaskNode) -> "int | None":
+    """The 1-based position a DAG node's id names (``s3`` -> 3): the structurer numbers the nodes
+    by the agenda, and a node added during the run takes the next number."""
+    m = re.fullmatch(r"s(\d+)", str(node.id or ""))
+    return int(m.group(1)) if m else None
 
 
 def _budget_bonus(previous: "HarnessResult | None", attempts: int) -> int:
@@ -526,6 +609,22 @@ class ResearchLab:
         self._plan_doc: "PlanDoc | None" = None
         self._approved_plan: "PlanDoc | None" = None
         self._plan_feedback: list[str] = []
+        # The review of the plan so far: each reply and what it was told (answers, what a look-up
+        # found, a refusal), so the next answer is given in their light (RCHENLAB/AiScientist#120).
+        # Saved with the waiting plan: every reply is handled by a lab built anew.
+        self._review_log: list[dict[str, str]] = []
+        # The datasets the researcher can use (own and shared, with versions and files), for a reply
+        # that asks to look them up and for checking a step's dataset. Set by the gateway; ``None``
+        # where there is no account to list them for. Read once per lab (``_dataset_catalogue``).
+        self.dataset_catalog: "Callable[[], list[dict[str, Any]]] | None" = None
+        self._catalogue: "list[dict[str, Any]] | None" = None
+        # The plan phase as ONE append-only conversation with the PI (RCHENLAB/AiScientist#122): the
+        # draft, the review's PI turn, every reading of a reply and its answer or revision are turns of
+        # it, so each turn after the first reads its fixed prefix from the cache. Saved with the plan.
+        self._plan_conversation: "PlanConversation | None" = None
+        # The PI's structured steps (tool, settings, skill) by step text, checked by code when the plan
+        # document is made (``_apply_drafted``); the binding and skill calls are its fallback.
+        self._drafted: "dict[str, dict[str, Any]]" = {}
         # The registered tools a restored plan was drafted against (saved with it); None while the
         # plan is this process's own draft, whose tools are the Scientist's catalog.
         self._planned_with: "list[str] | None" = None
@@ -556,6 +655,8 @@ class ResearchLab:
         self._step_asks_unanswered = False
         # The steps the user skipped at a failed step's decision point (``LabResult.skipped_steps``).
         self._skipped_steps: list[str] = []
+        # Plan steps held as not available while model-written code is off (code_gate.py).
+        self._unavailable: "list[Any]" = []
         # The skills steering THIS run: the user-PINNED ones (mandatory) + one the PI auto-selects on
         # top (Axis B), extended in ``run()``. Carry their reference-code templates (progressive
         # disclosure). Empty = free planning.
@@ -595,9 +696,13 @@ class ResearchLab:
             "team": [asdict(s) for s in self._team] if self._team else None,
             "self_sourced": self._self_sourced, "later": list(self._later),
             "request_breadth": self._request_breadth, "feedback": list(self._plan_feedback),
+            "review": [dict(r) for r in self._review_log],
+            "conversation": self._plan_conversation.to_dict() if self._plan_conversation else None,
             "design_background": list(self._design_citations),
             "planned_with": (list(self._planned_with) if self._planned_with is not None else
                              sorted(t.name for t in self.scientist.catalog if t.name.startswith("mcp_"))),
+            # The steps held as not available (code_gate.py): the approved run's reply lists them.
+            "unavailable": code_gate.record(self._unavailable),
         }
 
     def _restore_plan_context(self, state: "dict[str, Any]") -> None:
@@ -618,9 +723,12 @@ class ResearchLab:
         self._later = list(state.get("later") or [])
         self._request_breadth = str(state.get("request_breadth") or "")
         self._plan_feedback = list(state.get("feedback") or [])
+        self._review_log = [dict(r) for r in state.get("review") or [] if isinstance(r, dict)]
+        self._plan_conversation = PlanConversation.from_dict(state.get("conversation"))
         self._design_citations = list(state.get("design_background") or [])
         # A plan saved before this was recorded keeps an empty list: nothing vouches for its prose.
         self._planned_with = [str(name) for name in state.get("planned_with") or []]
+        self._unavailable = code_gate.restore(state.get("unavailable"))
 
     @property
     def approved_plan_yaml(self) -> str:
@@ -665,6 +773,11 @@ class ResearchLab:
         """Analyses the PI left out because the request did not ask for them — what the user can
         ask for next in the same conversation."""
         return list(self._later)
+
+    @property
+    def unavailable_steps(self) -> "list[dict[str, Any]]":
+        """The plan steps that do not run because no tested tool or skill does them (code_gate.py)."""
+        return code_gate.record(self._unavailable)
 
     @property
     def proposed_steps(self) -> "list[dict[str, Any]]":
@@ -748,6 +861,7 @@ class ResearchLab:
         """
         self._should_cancel = kwargs.get("should_cancel") or (args[3] if len(args) > 3 else None)
         self._planning = True
+        self._unavailable = []     # steps held as not available (code_gate.py), for this run
         try:
             self._check_cancelled()
             result = self._run_inner(*args, **kwargs)
@@ -769,6 +883,8 @@ class ResearchLab:
             result.skipped_steps = list(dict.fromkeys(self._skipped_steps))
         if isinstance(result, LabResult) and self._report_requested:
             result.report_requested = True
+        if isinstance(result, LabResult) and self._unavailable and not result.unavailable_steps:
+            result.unavailable_steps = code_gate.record(self._unavailable)
         if isinstance(result, LabResult) and self._approved_plan is not None and result.rounds:
             # Compared here, on the one exit every path shares, for the same reason as above. A run
             # with no rounds (cancelled at review) has nothing to compare. The report step is the
@@ -781,7 +897,9 @@ class ResearchLab:
                 for r in result.rounds] + [
                 {"step": s, "accepted": True, "calls": [{"tool": REPORT_TOOL, "args": {}, "ok": True,
                  "provider": report_tool_identity()}]}
-                for s in self._report_steps], approved_additions=self._approved_additions)
+                for s in self._report_steps], approved_additions=self._approved_additions,
+                per_call={s.id: tuple(held) for s in self._approved_plan.steps
+                          if s.tool and (held := self._per_library_held(s.text))})
             on_event = kwargs.get("on_event") or (args[1] if len(args) > 1 else None)
             if on_event is not None:
                 on_event({"type": "plan_adherence", **self._plan_adherence})
@@ -895,6 +1013,7 @@ class ResearchLab:
                                      if i in redo or i not in kept_by_index)
             assert_plan_available(agenda, self.scientist.catalog, plan=resume.approved_plan,
                                   indices=redo_indices, planned_with=self._planned_with or ())
+            code_gate.refuse_code_steps(agenda, resume.approved_plan, redo_indices)
             assert_resume_document(agenda, resume.approved_plan, redo_indices, resume.modify_note)
             emit({"type": "run_resumed", "agenda": len(agenda), "from_step": k + 1,
                   "redo": sorted(i + 1 for i in redo_indices),
@@ -926,6 +1045,7 @@ class ResearchLab:
             exec_multi = True if self._mode == "team" else self.config.multi_specialist
             if approved_plan is not None:
                 check_restored(list(payload))
+                code_gate.refuse_code_steps(list(payload), approved_plan)
                 self._approve_plan_document(emit)
                 plan_review = None
         else:
@@ -1060,6 +1180,10 @@ class ResearchLab:
             if kind == "failed":
                 emit({"type": "plan_failed", "reason": payload})
                 return LabResult(question, [], [], False, 0, str(payload))
+            if kind == "agenda":
+                payload = code_gate.hold_code_steps(self, payload, emit, source="draft", redrafted=True)
+                if code_gate.nothing_runs(self, payload):
+                    return code_gate.not_available_result(self, question, emit)
             # PI<->Critic review runs BEFORE the plan reaches the human, not instead of it. The old
             # condition skipped the review whenever a human was curating ("their decision wins") —
             # and "Plan first" is checked by default, so on the path almost every real run takes, the
@@ -1069,6 +1193,7 @@ class ResearchLab:
             if plan_review is not None and kind == "agenda":
                 payload = self._keep_report_step(list(payload), self._apply_scope(
                     self._plan_review(question, list(payload), emit), emit))
+                payload = code_gate.hold_code_steps(self, payload, emit, source="plan_review")
                 emit({"type": "pi_agenda", "agenda": payload})
 
         # Plan mode (human-in-the-loop): the user does NOT text-edit the plan — they
@@ -1082,6 +1207,9 @@ class ResearchLab:
             feedback_log = self._plan_feedback
             reported_tooling: set[str] = set()
             pending_cutoffs: "tuple[str, dict[str, Any]] | None" = None
+            # The plan was drafted anew from the reviewer's words (a whole redraft, not a patch of
+            # one step): its held steps replace the earlier ones (code_gate.hold_code_steps).
+            redrafted = False
             while True:
                 # A Stop clicked while the PI was re-drafting (the previous loop turn's model
                 # call) must land here, before another card is pushed at the user.
@@ -1096,6 +1224,13 @@ class ResearchLab:
                     if restored:
                         check_restored(list(payload))
                     payload = self._check_plan_tooling(list(payload), emit, reported_tooling)
+                    payload = code_gate.hold_code_steps(
+                        self, payload, emit,
+                        source="revision" if feedback_log else "saved_plan" if restored else "draft",
+                        redrafted=redrafted)
+                    redrafted = False
+                    if code_gate.nothing_runs(self, payload):
+                        return code_gate.not_available_result(self, question, emit)
                     self._present_plan_document(question, list(payload), emit)
                     if pending_cutoffs is not None:
                         # The last reply was revised from its words (patch or redraft); the cutoffs
@@ -1163,73 +1298,135 @@ class ResearchLab:
                     emit({"type": "plan_no_request", "text": fb[:120]})
                     emit({"type": "pi_agenda", "agenda": payload})
                     continue
-                # A QUESTION is not a revision. Everything a reviewer typed used to become one, so
-                # "why is step 3 a Wilcoxon test?" did not get an answer — it triggered a redraft,
-                # and a redraft damages the steps nobody mentioned. Answer it and hand back the
-                # SAME plan, unchanged, so asking costs nothing.
-                if kind == "agenda" and fb and classify_plan_reply(fb) == "question":
-                    emit({"type": "plan_question", "text": fb})
-                    answer = self._answer_plan_question(question, list(payload), fb)
-                    emit({"type": "plan_answer", "question": fb, "answer": answer})
-                    emit({"type": "pi_agenda", "agenda": payload})   # re-present it untouched
-                    continue
                 # A cutoff named with a number ("raise the mitochondrial limit to 20") is read by code
                 # and set on every step whose tool takes it, so the number typed is the number that
-                # runs; one that cannot be used is explained back, and the plan is re-presented as it
-                # was (issue 61). A reply that asks for something else too goes to the reviser with
-                # the cutoffs pinned, so the rest of it is not lost.
+                # runs (issue 61). A reply of nothing but cutoffs keeps that path: no model reads it.
+                # Not a reply the word lists take for a question: a question never changes the plan.
                 cutoffs: "dict[str, Any]" = {}
-                cutoffs_only = False
-                if kind == "agenda" and fb:
+                if kind == "agenda" and fb and classify_plan_reply(fb) != "question":
                     cutoffs, cutoff_problems, cutoffs_only = self._cutoff_request(fb)
                     if cutoff_problems:
+                        # One that cannot be used is explained back, and the plan is re-presented
+                        # as it was.
                         emit({"type": "plan_answer", "question": fb,
                               "answer": "Nothing was changed. " + " ".join(cutoff_problems)})
                         emit({"type": "pi_agenda", "agenda": payload})
                         continue
-                if cutoffs_only:
-                    # Nothing but cutoffs: set by code, no model call. (Before the reference check
-                    # below: a step whose tool takes the cutoff is the step the reply points at,
-                    # whatever words that step uses.)
-                    ops = self._cutoff_ops(cutoffs)
-                    revised = self._revise_plan_document(question, fb, emit, ops=ops) if ops else None
-                    if revised is not None:
-                        feedback_log.append(fb)
-                        payload = revised
-                    else:
-                        said = ", ".join(f"{k} = {v}" for k, v in cutoffs.items())
-                        emit({"type": "plan_answer", "question": fb, "answer": (
-                            f"Nothing was changed: the plan already uses {said}." if not ops else
-                            f"Nothing was changed: {said} could not be set on this plan.")})
-                    emit({"type": "pi_agenda", "agenda": payload})
-                    continue
-                # A change request that points at a step the plan does NOT have, or names one of
-                # several equally good candidates, is a question in disguise — the reviewer and the
-                # plan disagree about what is in it. Say so and re-present the plan untouched,
-                # rather than silently constructing the missing step or picking a candidate. See
-                # ``resolve_plan_reference`` for the two production cases this replaces.
+                    if cutoffs_only:
+                        ops = self._cutoff_ops(cutoffs)
+                        revised = self._revise_plan_document(question, fb, emit, ops=ops) if ops else None
+                        if revised is not None:
+                            feedback_log.append(fb)
+                            payload = revised
+                        else:
+                            said = ", ".join(f"{k} = {v}" for k, v in cutoffs.items())
+                            emit({"type": "plan_answer", "question": fb, "answer": (
+                                f"Nothing was changed: the plan already uses {said}." if not ops else
+                                f"Nothing was changed: {said} could not be set on this plan.")})
+                        emit({"type": "pi_agenda", "agenda": payload})
+                        continue
+                # What the reply asks for, read by the model (RCHENLAB/AiScientist#120): its
+                # questions, its changes and what it asks to be looked up first, each part on its
+                # own. The answer comes first, then the look-up, then the change; a reply that
+                # asks only questions hands back the SAME plan, unchanged, so asking costs nothing.
+                change = fb
+                looked_up = False
                 if kind == "agenda" and fb:
-                    verdict, topic, hits = resolve_plan_reference(fb, list(payload))
+                    reading = self._read_plan_reply(fb, list(payload))
+                    emit({"type": "plan_reply_read", **reading.to_dict()})
+                    questions, changes, lookups = reading.questions, reading.changes, reading.lookups
+                    if lookups and not lookup_about_data(" ".join([*lookups, *changes])):
+                        # Not a look-up of data ("find the DE genes between KO and WT and add a
+                        # volcano plot"): what it asks is done as the rest of the reply, never refused
+                        # for want of a dataset catalogue.
+                        if changes:
+                            changes = [*lookups, *changes]
+                        else:
+                            questions = [*questions, *lookups]
+                        lookups = []
+                    told: list[str] = []
+                    if questions:
+                        asked = " ".join(questions)
+                        emit({"type": "plan_question", "text": asked, "then_change": bool(changes)})
+                        answer = self._answer_plan_question(
+                            question, list(payload), asked,
+                            datasets=bool(lookups) or _mentions_data(asked))
+                        emit({"type": "plan_answer", "question": asked, "answer": answer,
+                              "then_change": bool(changes)})
+                        told.append(answer)
+                    catalogue: "list[dict[str, Any]]" = []
+                    if lookups:
+                        looked_up = True
+                        catalogue = self._dataset_catalogue()
+                        listing = plan_datasets.found_text(catalogue)
+                        emit({"type": "plan_lookup", "request": " ".join(lookups)[:300],
+                              "found": listing, "datasets": len(catalogue),
+                              "available": self.dataset_catalog is not None})
+                        told.append(("Datasets you can use:\n" + listing) if listing else
+                                    "No datasets were found in your data or the shared datasets.")
+                    change = " ".join(changes)
+                    if not change:
+                        self._note_review(fb, told)
+                        emit({"type": "pi_agenda", "agenda": payload})   # re-present it untouched
+                        continue
+
+                    def refuse(why: str) -> None:
+                        emit({"type": "plan_refused", "request": change[:300], "reason": why})
+                        self._note_review(fb, [*told, "Nothing was changed: " + why])
+                        emit({"type": "pi_agenda", "agenda": payload})
+
+                    if looked_up and not catalogue:
+                        refuse("no datasets were found in your data or the shared datasets, so there "
+                               "was nothing to write into the plan. Upload a dataset, or attach a "
+                               "shared one to this chat, then ask again."
+                               if self.dataset_catalog is not None else
+                               "datasets cannot be looked up on this server. Attach the dataset to "
+                               "this chat, then ask again.")
+                        continue
+                    # The cutoffs the CHANGE names (a question about a cutoff names none to set).
+                    cutoffs, cutoff_problems, _ = self._cutoff_request(change)
+                    if cutoff_problems:
+                        refuse(" ".join(cutoff_problems))
+                        continue
+                    # A change request that points at a step the plan does NOT have, or names one of
+                    # several equally good candidates, is a question in disguise — the reviewer and
+                    # the plan disagree about what is in it. Say so and re-present the plan
+                    # untouched, rather than silently constructing the missing step or picking a
+                    # candidate. See ``resolve_plan_reference`` for the two production cases this
+                    # replaces.
+                    verdict, topic, hits = resolve_plan_reference(change, list(payload))
                     if verdict != "ok":
                         emit({"type": "plan_reference", "verdict": verdict, "topic": topic,
-                              "steps": hits, "request": fb[:300]})
+                              "steps": hits, "request": change[:300]})
+                        self._note_review(fb, told)
                         emit({"type": "pi_agenda", "agenda": payload})
                         continue
-                # With the plan as a document, a change asked for in words is made on that
-                # document: the model names what to change and code applies it, like a hand edit.
-                # Only when that cannot be done does the revision fall back to patch-or-redraft.
-                if kind == "agenda" and fb:
-                    revised = self._revise_plan_document(question, fb, emit, pinned=cutoffs)
+                    # With the plan as a document, a change asked for in words is made on that
+                    # document: the model names what to change and code applies it, like a hand
+                    # edit. A change it cannot make is refused in words and the plan stays as it
+                    # was; only a reply it could not turn into operations falls back to
+                    # patch-or-redraft, and never one that asked for a look-up, which only the
+                    # document revision can use.
+                    refusals: list[str] = []
+                    revised = self._revise_plan_document(question, change, emit, pinned=cutoffs,
+                                                         lookup=looked_up, refusals=refusals, reply=fb)
                     if revised is not None:
-                        feedback_log.append(fb)
+                        feedback_log.append(change)
                         payload = revised
+                        self._note_review(fb, [*told, "The plan was changed as asked."])
                         emit({"type": "pi_agenda", "agenda": payload})
                         continue
+                    if refusals or looked_up:
+                        refuse(refusals[0] if refusals else
+                               "what was found could not be written into the plan. Name the dataset and "
+                               "the step, or set the step's dataset on the plan card.")
+                        continue
+                    self._note_review(fb, told)
                 # The patch or redraft below works from the words; the cutoffs read from them are set
                 # on the plan it gives, when the loop brings the document up to date with it.
-                pending_cutoffs = (fb, cutoffs) if cutoffs else None
-                if fb:
-                    feedback_log.append(fb)
+                pending_cutoffs = (change, cutoffs) if cutoffs else None
+                if change:
+                    feedback_log.append(change)
                 before_plan = list(payload) if kind == "agenda" else []
                 kind, payload = self._pi_plan(
                     question, emit, feedback="\n".join(feedback_log),
@@ -1237,7 +1434,21 @@ class ResearchLab:
                     allow_clarify=True,
                     # The patch is judged against ONLY what the user just said; the accumulated log
                     # still drives a redraft, where the full history is the right context.
-                    latest_feedback=fb)
+                    latest_feedback=change)
+                # A revision that only pasted the reply into a step did not carry it out (#120).
+                echoed = [s for s in (payload if kind == "agenda" else []) if s not in before_plan
+                          and fb and (copies_reply(s, fb) or copies_reply(s, change))] if before_plan else []
+                if echoed:
+                    emit({"type": "plan_refused", "request": change[:300],
+                          "reason": "the revision only repeated your message in the plan instead of "
+                                    "carrying it out. Say which step to change and how, or edit the "
+                                    "step on the plan card."})
+                    if feedback_log and feedback_log[-1] == change:
+                        feedback_log.pop()
+                    pending_cutoffs = None
+                    kind, payload = "agenda", before_plan
+                    emit({"type": "pi_agenda", "agenda": payload})
+                    continue
                 if kind == "failed":
                     if before_plan:
                         # The revision could not be read. The plan the researcher had is still a
@@ -1253,6 +1464,7 @@ class ResearchLab:
                 # damage a step it did not name (this code applies the edit, so collateral is
                 # structurally impossible); the whole-plan redraft can, and did — so diff it and
                 # put the collateral in front of the reviewer. See ``diff_plans``.
+                redrafted = kind == "agenda" and not getattr(self, "_last_plan_was_patch", False)
                 if before_plan and kind == "agenda" and not getattr(self, "_last_plan_was_patch", False):
                     delta = diff_plans(before_plan, list(payload))
                     if delta["dropped"] or delta["changed"]:
@@ -1309,6 +1521,7 @@ class ResearchLab:
         if plan_review is None and approved_plan is None:
             agenda = self._keep_report_step(agenda, self._apply_scope(
                 self._plan_review(question, agenda, emit), emit))
+            agenda = code_gate.hold_code_steps(self, agenda, emit, source="plan_review")
 
         # Read-back guard (deterministic). A step that only re-reads a table an earlier step wrote
         # produces nothing and consumes a slot a real analysis needed. The PI prompt already forbids
@@ -1390,6 +1603,11 @@ class ResearchLab:
                 agenda = [s for s in agenda if not _is_enrichment_step(s)]
                 emit({"type": "steps_pruned", "reason": "no_experimental_contrast", "dropped": dropped})
 
+        # Whatever entered the plan above, a step that needs model-written code does not run.
+        agenda = code_gate.hold_code_steps(self, agenda, emit, source="final")
+        if code_gate.nothing_runs(self, agenda):
+            return code_gate.not_available_result(self, question, emit)
+
         # Plan-time methodological decision — the linear-path HITL. The DAG path surfaces forks
         # per-node (_structure_agenda_dag flags them; _run_one_node pauses); the linear loop had NO
         # such pause, so a fork like "the dataset is already labeled — analyze by the labels or
@@ -1422,6 +1640,19 @@ class ResearchLab:
             # numbers bind the tools to, and what the finished run is read back against.
             self._present_plan_document(question, list(agenda), emit)
             self._approve_plan_document(emit, reviewed=False)
+
+        # A step of the approved plan that will not run — left out above as a re-read, packaging
+        # work, or enrichment with nothing to read or nothing to contrast — is marked skipped on the
+        # plan cards, so it does not read "not started" for good (RCHENLAB/AiScientist#121). The
+        # write_report step is not one of them: the gateway runs it after the analysis.
+        if self._approved_plan is not None:
+            running = {" ".join(s.split()) for s in agenda}
+            later = {" ".join(s.split()) for s in getattr(self, "_report_steps", None) or []}
+            for st in self._approved_plan.steps:
+                flat = " ".join(st.text.split())
+                if flat not in running and flat not in later:
+                    self.mark_step(emit, st.text, "skipped",
+                                   reason="left out before the run started; the progress list says why")
 
         self._check_cancelled()
         self._planning = False
@@ -1581,6 +1812,8 @@ class ResearchLab:
         """
         if not (self.config.skill_induction and self.config.induced_skills_dir):
             return []
+        if not model_written_code():
+            return []      # it learns from accepted run_code, which this deployment does not run
         from ..skill_induction import candidates, induce, write_skill
         # ALL_SKILLS, not SKILLS: a skill still awaiting review is invisible to the models but its
         # name is taken, and the inducer must not re-learn it under another name.
@@ -1654,6 +1887,10 @@ class ResearchLab:
             return [], "pi_declined"
         steps = [str(s).strip() for s in (rev.get("agenda") or []) if str(s).strip()]
         steps = [s for s in steps if not _is_report_busywork(s)][:self.config.max_steps]
+        planned = len(steps)
+        steps = code_gate.hold_code_steps(self, steps, emit, source="next_cycle")
+        if len(steps) < planned and code_gate.nothing_runs(self, steps):
+            steps = []      # the hold took every step that would run: a report of nothing is not a cycle
         if not steps:
             emit({"type": "cycle_declined", "cycle": cycle, "reason": reason or "empty plan"})
             return [], "pi_declined"
@@ -1785,6 +2022,9 @@ class ResearchLab:
                     rounds.append(kept)
                     if kept.verdict.verdict == "accept":
                         accepted_steps += 1
+                    self.mark_step(emit, agenda[step_idx],
+                                     "done" if kept.verdict.verdict == "accept" else "failed",
+                                     index=step_idx + 1, reason="kept from the run this one continues")
                     step_idx += 1
                     continue
             # Stop between steps if the user hit Stop (they often only notice a wrong turn
@@ -1824,6 +2064,7 @@ class ResearchLab:
                 pruned.add(step_idx)
                 emit({"type": "steps_pruned", "reason": "preflight", "dropped": [step],
                       "detail": gate.reason})
+                self.mark_step(emit, step, "skipped", index=step_idx + 1, reason=gate.reason or "")
                 step_idx += 1
                 attempts = 0
                 critique = ""
@@ -1833,6 +2074,8 @@ class ResearchLab:
             if gate.action == "amend" and gate.amendment:
                 amend_line = "[Plan review — adjust how you run THIS step]: " + gate.amendment
                 call_notes = (user_notes + "\n" + amend_line) if user_notes else amend_line
+            self.mark_step(emit, step, "processing", index=step_idx + 1,
+                             reason="revising after the Critic's review" if attempts else "")
             result = self._scientist(question, step, specialist, critique, rounds, emit, should_cancel,
                                      user_notes=call_notes,
                                      extra_steps=_budget_bonus(last_result, attempts))   # Scientist node
@@ -1856,6 +2099,7 @@ class ResearchLab:
             accepted = verdict.verdict == "accept"
             if accepted:
                 accepted_steps += 1
+                self.mark_step(emit, step, "done", index=step_idx + 1)
                 # PI POST-STEP review: did this step change the picture, and is any REMAINING step now
                 # moot? Prune those so the plan stays honest (linear loop enacts the prune).
                 review = self._poststep_review(question, step, verdict, result, agenda, step_idx,
@@ -1866,6 +2110,8 @@ class ResearchLab:
                             pruned.add(j)
                             emit({"type": "steps_pruned", "reason": "poststep_review",
                                   "dropped": [txt], "detail": review.get("contribution", "")})
+                            self.mark_step(emit, txt, "skipped", index=j + 1,
+                                             reason=str(review.get("contribution", "") or ""))
                             break
                 # EXPLORATION — the plan's only growth path. A result that contradicts the plan's
                 # premise becomes a falsifiable hypothesis plus the step(s) that test it, appended to
@@ -1877,6 +2123,8 @@ class ResearchLab:
                 if new_steps:
                     agenda.extend(new_steps)
                     emit({"type": "agenda_extended", "added": new_steps, "agenda": len(agenda)})
+                    for k, text in enumerate(new_steps, len(agenda) - len(new_steps) + 1):
+                        self.mark_step(emit, text, "pending", index=k, reason="added during the run")
                 step_idx += 1
                 attempts = 0
                 critique = ""
@@ -1886,6 +2134,7 @@ class ResearchLab:
                 # the one attempt and move on (References fall back to whatever it did accept, or
                 # the honest-empty note).
                 emit({"type": "step_force_advance", "step": step})
+                self.mark_step(emit, step, "failed", index=step_idx + 1, reason=verdict.critique or "")
                 step_idx += 1
                 attempts = 0
                 critique = ""
@@ -1894,6 +2143,7 @@ class ResearchLab:
                 critique = verdict.critique
                 if attempts > self.config.max_revisions:   # stop revising this step; move on (NOT accepted)
                     emit({"type": "step_force_advance", "step": step})
+                    self.mark_step(emit, step, "failed", index=step_idx + 1, reason=verdict.critique or "")
                     step_idx += 1
                     attempts = 0
                     critique = ""
@@ -1935,6 +2185,7 @@ class ResearchLab:
                 break
             specialist = _route_specialist(step, exec_roster) if exec_multi else GENERALIST
             emit({"type": "literature_backfill", "step": step})
+            self.mark_step(emit, step, "processing", index=i + 1)
             result = self._scientist(question, step, specialist, "", rounds, emit,
                                      should_cancel, user_notes=user_notes)
             accepted_lit = result.status == "ok"
@@ -1943,6 +2194,8 @@ class ResearchLab:
                 1.0 if accepted_lit else 0.0,
                 "" if accepted_lit else "literature_search returned no DOI/PMID-backed citations",
             )
+            self.mark_step(emit, step, "done" if accepted_lit else "failed", index=i + 1,
+                             reason=verdict.critique)
             rounds.append(LabRound(len(rounds) + 1, i + 1, step, specialist.name,
                                    result.to_dict(), verdict))
             if accepted_lit:
@@ -2146,6 +2399,8 @@ class ResearchLab:
         call from a worker thread: it only reads shared state and appends to its own local list."""
         node_notes = ""
         if node.decision:
+            self.mark_step(emit, node.goal, "processing", index=_node_index(node),
+                             reason="waiting for your choice")
             emit({"type": "decision_point", "node": node.id, "goal": node.goal,
                   "options": list(node.options)})
             if decision_review is not None:
@@ -2188,7 +2443,13 @@ class ResearchLab:
         if gate.action == "amend" and gate.amendment:
             step_notes = "\n".join(t for t in (
                 step_notes, "[Plan review — adjust how you run THIS step]: " + gate.amendment) if t)
+        node_index = _node_index(node)
+        retried = False
         while True:   # revise the SAME node in place, then advance
+            self.mark_step(emit, node.goal, "processing", index=node_index,
+                             reason=("retrying with an alternative approach" if retried
+                                     else "revising after the Critic's review" if attempts else ""))
+            retried = False
             # The brief is the node's goal plus reuse hints; the approved plan knows the step by its
             # goal. Looked up by the brief, no step matched and no approved setting was ever pinned
             # (prod run caa188e8e672: run_cellqc got species=auto against an approved "mouse").
@@ -2203,9 +2464,11 @@ class ResearchLab:
             node_rounds.append(LabRound(0, 0, node.goal, specialist.name, result.to_dict(), verdict))
             if verdict.verdict == "accept":
                 accepted = True
+                self.mark_step(emit, node.goal, "done", index=node_index)
                 break
             if _is_literature_step(node.goal):
                 emit({"type": "step_force_advance", "step": node.goal})
+                self.mark_step(emit, node.goal, "failed", index=node_index, reason=verdict.critique or "")
                 break
             attempts += 1
             critique = verdict.critique
@@ -2226,8 +2489,10 @@ class ResearchLab:
                         critique = ((verdict.critique or "")
                                     + (f"\n\nAlternative approach to try: {hint}" if hint else "")).strip()
                         emit({"type": "step_retry", "node": node.id, "approach": hint[:120]})
+                        retried = True
                         continue
                 emit({"type": "step_force_advance", "step": node.goal})
+                self.mark_step(emit, node.goal, "failed", index=node_index, reason=verdict.critique or "")
                 break
         # Axis C — write ONE episode for this node (private to this expert), for cross-run learning.
         if self._agent_memory is not None:
@@ -2264,7 +2529,7 @@ class ResearchLab:
                 m = re.search(r"\[.*\]", raw or "", re.DOTALL)
                 obj = json.loads(m.group(0)) if m else None
             if isinstance(obj, list):
-                return [str(x).strip() for x in obj if str(x).strip()][:4]
+                return code_gate.drop_code_alternatives([str(x).strip() for x in obj if str(x).strip()])[:4]
         except Exception:  # noqa: BLE001 - proposing alternatives is best-effort; degrade to skip
             pass
         return []
@@ -2302,7 +2567,7 @@ class ResearchLab:
             return ("retry", alternatives[0]) if alternatives else ("skip", "")
 
         # Manual: the LLM's alternatives ARE the options, plus explicit Skip / Abort controls.
-        skip_opt, abort_opt = "Skip this step", "Abort the run"
+        skip_opt, abort_opt = "Skip this step", ABORT_RUN_OPTION
         options = [*alternatives, skip_opt, abort_opt]
         goal = (f"Step failed after {self.config.max_revisions + 1} attempts: {node.goal}. "
                 f"Reason: {(critique or 'no usable result').strip()[:200]}. "
@@ -2523,6 +2788,8 @@ class ResearchLab:
                     agenda_goals = plan.goals()
                     emit({"type": "agenda_extended", "added": new_steps, "agenda": n_nodes,
                           "after_node": node.id})
+                    for k, text in enumerate(new_steps, n_nodes - len(new_steps) + 1):
+                        self.mark_step(emit, text, "pending", index=k, reason="added during the run")
             if cancelled:
                 emit({"type": "run_cancelled", "completed_steps": len(accepted_ids), "agenda": n_nodes})
                 break
@@ -2559,12 +2826,15 @@ class ResearchLab:
                 break
             specialist = _route_specialist(node.goal, exec_roster) if exec_multi else GENERALIST
             emit({"type": "literature_backfill", "step": node.goal})
+            self.mark_step(emit, node.goal, "processing", index=_node_index(node))
             result = self._scientist(question, node.goal, specialist, "", rounds, emit,
                                      should_cancel, user_notes=user_notes)
             accepted_lit = result.status == "ok"
             verdict = CriticVerdict(
                 "accept" if accepted_lit else "revise", 1.0 if accepted_lit else 0.0,
                 "" if accepted_lit else "literature_search returned no DOI/PMID-backed citations")
+            self.mark_step(emit, node.goal, "done" if accepted_lit else "failed",
+                             index=_node_index(node), reason=verdict.critique)
             rounds.append(LabRound(len(rounds) + 1, len(rounds) + 1, node.goal,
                                    specialist.name, result.to_dict(), verdict))
             done_ids.add(node.id)
@@ -2857,8 +3127,9 @@ class ResearchLab:
             def _on(ev: "dict[str, Any]") -> None:
                 et = ev.get("type")
                 if et == "tool_start":
+                    # The arguments go to the run's record of tool calls, never to the chat (#121).
                     emit({"type": "expert_tool", "member": member,
-                          "tool": ev.get("tool"), "state": "start"})
+                          "tool": ev.get("tool"), "state": "start", "args": ev.get("args")})
                 elif et == "tool_result":
                     emit({"type": "expert_tool", "member": member, "tool": ev.get("tool"),
                           "state": "done", "detail": str(ev.get("summary") or "")[:200],
@@ -2960,18 +3231,19 @@ class ResearchLab:
             # INFORMATION ASYMMETRY: each expert holds a different slice of the accepted findings
             # (see _assign_evidence). This is what makes the disagreement worth having.
             evidence = _assign_evidence(experts, rounds_ctx or [])
+            # What every expert is given comes FIRST and is the same text for all of them: the
+            # instructions, the study context and the topic. What is each expert's own (its slice of
+            # the evidence, its persona) comes LAST, so the experts' calls share one prompt prefix
+            # and a prefix cache serves it once per round, not once per expert (#122).
+            # The study context, not just the question: a design meeting held over "complete the
+            # research" is a meeting about nothing, and 4 of 11 production team runs were launched
+            # exactly that way.
+            shared = f"{self._study_context(question)}\n\nMeeting topic:\n{topic}{collab}"
             msg_lists = [[
-                {"role": "system", "content": (
-                    f"You are {e.name}, an expert team member. {e.persona} Contribute concise, "
-                    "specific, technically-grounded input on the meeting topic from YOUR expertise. "
-                    "Be honest about uncertainty and disagree when the evidence warrants. You hold "
-                    "only PART of the picture — say so rather than papering over what you cannot see.")},
-                # The study context, not just the question: a design meeting held over "complete
-                # the research" is a meeting about nothing, and 4 of 11 production team runs were
-                # launched exactly that way.
-                {"role": "user", "content": f"{self._study_context(question)}\n\n"
+                {"role": "system", "content": _MEETING_EXPERT_SYSTEM},
+                {"role": "user", "content": shared + "\n\n"
                                             + (evidence[i] + "\n\n" if evidence[i] else "")
-                                            + f"Meeting topic:\n{topic}{collab}\n\nYour input:"},
+                                            + f"You are {e.name}. {e.persona}\n\nYour input:"},
             ] for i, e in enumerate(experts)]
             texts = self._expert_turns(msg_lists, emit,               # CONCURRENT → batched on the GPU
                                        [e.name for e in experts])
@@ -3527,13 +3799,16 @@ class ResearchLab:
                          "218 GiB. Subset first or read it backed, and size the job's memory to match.")
         return "\n".join(lines)
 
-    def _answer_plan_question(self, question: str, agenda: list[str], asked: str) -> str:
+    def _answer_plan_question(self, question: str, agenda: list[str], asked: str, *,
+                              datasets: bool = False) -> str:
         """Answer a reviewer's question ABOUT the plan, changing nothing.
 
         Given the same material the PI planned from — the plan, the research-path guidance and the
-        dataset profile — so the answer is grounded in this study rather than in generalities. Any
-        failure returns a short honest string: a question that cannot be answered must not take the
-        plan down with it."""
+        dataset profile — so the answer is grounded in this study rather than in generalities, and
+        the earlier questions and answers of the same review, so a follow-up is answered in their
+        light (RCHENLAB/AiScientist#120). ``datasets``: the question is about data, and the datasets
+        the researcher can use are given too. Any failure returns a short honest string: a question
+        that cannot be answered must not take the plan down with it."""
         parts = [f"Research question:\n{question}\n",
                  "The plan you proposed:\n"
                  + "\n".join(f"{i}. {s}" for i, s in enumerate(agenda, 1)) + "\n"]
@@ -3544,13 +3819,90 @@ class ResearchLab:
         ctx = self._dataset_context()
         if ctx:
             parts.append(ctx + "\n")
+        if self._in_conversation:
+            # In the plan phase's conversation the PI already holds the request, the guidance, the
+            # dataset profile and the review so far: the turn carries only what changed and the question.
+            parts = (["The current plan document and its settings:\n" + self._plan_doc.to_yaml()]
+                     if self._plan_doc is not None else
+                     ["The plan as it stands:\n" + "\n".join(f"{i}. {s}" for i, s in enumerate(agenda, 1)) + "\n"])
+        listing = plan_datasets.catalogue_text(self._dataset_catalogue()) if datasets else ""
+        if listing:
+            parts.append(listing + "\n")
+        earlier = "" if self._in_conversation else self._review_block()
+        if earlier:
+            parts.append(earlier + "\n")
         parts.append(f"The researcher asks:\n{asked}")
         try:
-            out = (self._complete([{"role": "system", "content": _PLAN_QA_SYSTEM},
-                                   {"role": "user", "content": "\n".join(parts)}], role="plan") or "").strip()
+            out = (self._pi_turn(_PLAN_QA_SYSTEM, "\n".join(parts)) or "").strip()
         except Exception as exc:  # noqa: BLE001 - never lose the plan over a question
             return f"(could not answer just now: {type(exc).__name__})"
         return out or "(no answer came back — ask again, or tell me what to change instead.)"
+
+    # -- a reply to the plan under review (RCHENLAB/AiScientist#120) -------------------------------
+
+    def _plan_outline(self, agenda: "list[str]") -> str:
+        """The plan in a few lines for reading a reply: each step's number, id, title, tool and data."""
+        doc = self._plan_doc
+        lines = []
+        for i, text in enumerate(agenda, 1):
+            step = doc.step_for(text) if doc is not None else None
+            title = (step.title if step is not None else "") or split_step(text)[0] or " ".join(text.split())[:160]
+            bits = [f"{i}." + (f" [{step.id}]" if step is not None else ""), title]
+            if step is not None and step.tool:
+                bits.append(f"— `{step.tool}`")
+            if step is not None and step.dataset:
+                bits.append(f"— reads {plan_datasets.describe(step.dataset)}")
+            lines.append(" ".join(bits))
+        return "\n".join(lines)
+
+    def _read_plan_reply(self, reply: str, agenda: "list[str]") -> ReplyReading:
+        """What ``reply`` asks for: its questions, changes and look-ups, read by the model, with the
+        word lists as the fallback (``plan_reply``)."""
+        if self._complete_fn is None:
+            return fallback_reading(reply)
+        history = () if self._in_conversation else self._review_log
+        try:
+            raw = self._pi_turn(_PLAN_REPLY_SYSTEM, reply_prompt(reply, self._plan_outline(agenda), history),
+                                role="classify")
+        except Exception:  # noqa: BLE001 - reading a reply must never cost the plan
+            return fallback_reading(reply)
+        return parse_reading(raw, reply) or fallback_reading(reply)
+
+    def _review_block(self) -> str:
+        """The earlier exchanges of this review, for the next answer and revision; ``''`` for none."""
+        turns = self._review_log[-6:]
+        if not turns:
+            return ""
+        lines = ["Earlier in this review of the plan (oldest first):"]
+        for t in turns:
+            lines.append(f"- The researcher wrote: {str(t.get('reply') or '')[:600]}")
+            if t.get("answer"):
+                lines.append(f"  You answered: {str(t['answer'])[:900]}")
+        return "\n".join(lines)
+
+    def _note_review(self, reply: str, told: "list[str]") -> None:
+        """Keep one exchange of the review: the reply and what it was told."""
+        said = "\n".join(t for t in told if t and t.strip())
+        self._review_log.append({"reply": reply[:2000], "answer": said[:4000]})
+        del self._review_log[:-20]
+
+    def _dataset_catalogue(self) -> "list[dict[str, Any]]":
+        """The datasets the researcher can use, read once per lab; ``[]`` when there is no catalogue
+        or it cannot be read (the look-up then says nothing was found, and why)."""
+        if self._catalogue is None:
+            try:
+                rows = self.dataset_catalog() if self.dataset_catalog is not None else []
+            except Exception:  # noqa: BLE001 - a look-up that fails finds nothing; the plan stands
+                rows = []
+            self._catalogue = plan_datasets.normalize(rows)
+        return self._catalogue
+
+    def _dataset_check(self) -> "Callable[[Any], tuple[dict[str, str] | None, str]] | None":
+        """The check of a step's ``dataset`` against the catalogue, or ``None`` where there is no
+        catalogue to judge by (a step's dataset is then taken as written)."""
+        if self.dataset_catalog is None:
+            return None
+        return plan_datasets.checker(self._dataset_catalogue())
 
     # -- the plan as a document (config.plan_yaml; agents/plan_doc.py) -----------------------------
 
@@ -3565,11 +3917,108 @@ class ResearchLab:
         doc, fresh = sync_plan(self._plan_doc, list(agenda), request=question,
                                tool_of=_primary_tool, runs_on_of=_tool_runs_on)
         if fresh:
-            doc = self._bind_plan_settings(doc, fresh, emit)
-            doc = self._assign_plan_skills(doc, fresh, emit)
+            # The PI's own structured steps, checked by code; the binding and skill calls are made
+            # only for the steps they do not settle (RCHENLAB/AiScientist#122).
+            doc, bind, skills = self._apply_drafted(doc, fresh, emit)
+            if bind:
+                doc = self._bind_plan_settings(doc, bind, emit)
+            if skills:
+                doc = self._assign_plan_skills(doc, skills, emit)
         doc = self._resolve_plan_provenance(doc, fresh)
         self._plan_doc = doc
         emit({"type": "plan_doc", "yaml": doc.to_yaml(), "steps": self._public_plan_steps(doc)})
+
+    def _apply_drafted(self, doc: PlanDoc, fresh: "list[int]",
+                       emit: EventFn) -> "tuple[PlanDoc, list[int], list[int]]":
+        """Settle the new steps at ``fresh`` from the PI's structured steps (``self._drafted``):
+        ``(document, steps the binder must still read, steps the skill matcher must still read)``.
+
+        The same rules as the two calls they replace. A step's settings are admitted by
+        ``bind_settings`` (the tool declares them, the step's sentence states them); a setting the
+        rule refuses sends the step to the binder. The step's tool stays the one its sentence names
+        first; a structured step that names another sends it to the binder too. A code step's skill
+        must be in the library; one the plan already gives an earlier step is dropped, unless the
+        step's own text names it; ``null`` is a decision (no skill). A step with no structured entry
+        goes to both calls, which is the whole plan when the PI's reply had no ``plan_steps``."""
+        if not self._drafted:
+            return doc, list(fresh), list(fresh)
+        schemas = _tool_schemas(list(getattr(self.scientist, "catalog", [])))
+        refresh_skills()
+        hidden = superseded_names(ATOMIC_SKILLS)
+        lib = {n: s for n, s in list(ATOMIC_SKILLS.items()) if n not in hidden}
+        steps = list(doc.steps)
+        held = {s.skill: j for j, s in enumerate(steps) if s.skill}
+        bind: list[int] = []
+        skills: list[int] = []
+        assigned: list[dict[str, Any]] = []
+        for i in fresh:
+            if not 0 <= i < len(steps):
+                continue
+            step = steps[i]
+            entry = self._drafted.get(" ".join(step.text.split()))
+            if entry is None:
+                bind.append(i)
+                skills.append(i)
+                continue
+            tool = step.tool
+            askable = bool(tool) and tool not in CODE_TOOLS and (
+                schemas.get(tool) or isinstance(schemas.get(tool), PlanParameters))
+            if askable:
+                given = entry.get("settings")
+                same_tool = entry.get("tool") in (None, tool)
+                if not same_tool or not isinstance(given, dict):
+                    bind.append(i)
+                else:
+                    proposed = {**call_settings(step.text, str(tool),
+                                                json_literals=isinstance(schemas[tool], PlanParameters)),
+                                **given}
+                    settings, refused = bind_settings(step.text, schemas[str(tool)], proposed)
+                    if any(d.get("param") in given for d in refused):
+                        bind.append(i)
+                    else:
+                        step = replace(step, settings=settings)
+            candidate = (not step.skill and not step.skills and (step.tool is None or step.tool in CODE_TOOLS)
+                         and not _is_literature_step(step.text) and lib)
+            if candidate:
+                named = skills_named_in(step.text, lib)
+                if "skill" not in entry and not named:
+                    skills.append(i)
+                else:
+                    name = named[0] if named else entry.get("skill")
+                    hit = get_skill(str(name), lib) if name else None
+                    if name and hit is None:
+                        skills.append(i)
+                    elif hit is not None and (named or hit.name not in held):
+                        step = replace(step, skill=hit.name)
+                        held.setdefault(hit.name, i)
+                        assigned.append({"step": i + 1, "id": step.id, "skill": hit.name,
+                                         "version": hit.version or "local",
+                                         "release": hit.registry_release or ""})
+            steps[i] = step
+        emit({"type": "plan_drafted_steps", "steps": len(fresh), "settled": len(fresh) - len(set(bind) | set(skills)),
+              "to_bind": len(bind), "to_match_skills": len(skills)})
+        if assigned:
+            emit({"type": "plan_skills", "assigned": assigned, "by": "draft"})
+        return PlanDoc(request=doc.request, steps=tuple(steps)), bind, skills
+
+    def _pi_turn(self, instruction: str, body: str, *, role: str = "plan") -> str:
+        """One turn of the plan phase's conversation with the PI (#122): ``instruction`` (what this
+        turn asks, and in which form) and ``body``, sent after the conversation so far, and kept in it.
+        With no conversation (a plan saved before it existed, or ``config.plan_conversation`` off) it
+        is a call of its own, with ``instruction`` as its system prompt, as before."""
+        convo = self._plan_conversation if self.config.plan_conversation else None
+        if convo is None or not convo.answered:
+            return self._complete([{"role": "system", "content": instruction},
+                                   {"role": "user", "content": body}], role=role)
+        content = f"{instruction}\n\n{body}"
+        reply = self._complete(convo.ask(content), role="plan")
+        convo.add(content, reply or "")
+        return reply
+
+    @property
+    def _in_conversation(self) -> bool:
+        convo = self._plan_conversation
+        return bool(self.config.plan_conversation and convo is not None and convo.answered)
 
     def _resolve_plan_provenance(self, doc: PlanDoc, fresh: Iterable[int] = ()) -> PlanDoc:
         """Resolve new assignments from registration; retain approved/restored pins verbatim."""
@@ -3893,8 +4342,17 @@ class ResearchLab:
             except Exception as exc:  # noqa: BLE001 - settings are an addition; the plan stands without them
                 emit({"type": "plan_bind_failed", "error": f"{type(exc).__name__}: {exc}"[:200]})
         dropped: list[dict[str, Any]] = []
+        several = len(self._bound_libraries()) > 1
         for i in askable:
             settings, refused = bind_settings(steps[i].text, schemas[str(steps[i].tool)], proposed[i])
+            if several:
+                # One value of a per-library fact (species, chemistry) over several libraries is not
+                # what runs (``_per_library_held``), so it is not put on the plan card either: the
+                # card of run 6e5a33230a46 said species = human for two mouse libraries and a human
+                # one. Left out, CellQC reads it from each library; `auto` says the same and stays.
+                for key in per_library_settings(str(steps[i].tool)):
+                    if key in settings and str(settings[key]).lower() != "auto":
+                        refused.append({"param": key, "value": settings.pop(key), "why": "per_library"})
             steps[i] = replace(steps[i], settings=settings)
             dropped += [{"step": i + 1, "tool": steps[i].tool, **d} for d in refused]
         if dropped:
@@ -3936,7 +4394,7 @@ class ResearchLab:
         edited, findings = check_plan(
             edited, _tool_schemas(list(getattr(self.scientist, "catalog", []))),
             is_known=lambda name: get_skill(name) is not None, skill_name=_skill_name,
-            before=self._plan_doc)
+            before=self._plan_doc, datasets=self._dataset_check())
         if findings:
             refuse([_PLAN_FINDING_WORDS.get(f["kind"], "{kind}").format(**f) + "." for f in findings])
             return None
@@ -4033,7 +4491,9 @@ class ResearchLab:
 
     def _revise_plan_document(self, question: str, request: str, emit: EventFn,
                               ops: "list[dict[str, Any]] | None" = None,
-                              pinned: "dict[str, Any] | None" = None) -> "list[str] | None":
+                              pinned: "dict[str, Any] | None" = None, *,
+                              lookup: bool = False, refusals: "list[str] | None" = None,
+                              reply: str = "") -> "list[str] | None":
         """Make the change the researcher asked for in words ON the plan document; the new agenda,
         or ``None`` to let the caller revise the old way (single-step patch, then redraft).
 
@@ -4047,7 +4507,14 @@ class ResearchLab:
 
         ``ops`` given are applied without the model. ``pinned`` settings (CellQC cutoffs the reply
         stated) win over the model's: they are set on every step that takes them, whatever value the
-        operations gave."""
+        operations gave.
+
+        The model is given the datasets the researcher can use (``lookup``: the reply asked for them
+        to be looked up; otherwise when a catalogue exists), so it can name a real one in a step's
+        ``dataset``, which is checked against that list. It never writes the reply into a step
+        (``copies_reply``, against ``request`` and the whole ``reply``). A request it cannot carry
+        out is refused in words: the reason goes into ``refusals`` and ``None`` is returned, the plan
+        unchanged (RCHENLAB/AiScientist#120)."""
         if not self.config.plan_yaml or self._plan_doc is None or not request.strip() \
                 or (self._complete_fn is None and not ops):
             return None
@@ -4057,15 +4524,25 @@ class ResearchLab:
             f"- {name}: " + (", ".join(k for k, v in props.items() if isinstance(v, dict)) or "(no settings)")
             for name, props in schemas.items() if name != "finish")
         if not ops:
+            listing = (plan_datasets.catalogue_text(self._dataset_catalogue())
+                       if lookup or self.dataset_catalog is not None else "")
+            earlier = "" if self._in_conversation else self._review_block()
             try:
-                raw = self._complete([
-                    {"role": "system", "content": _PLAN_REVISE_SYSTEM},
-                    {"role": "user", "content": f"Plan:\n```yaml\n{before.to_yaml().strip()}\n```\n\n"
-                                                f"Tools (name: the settings it takes):\n{tools}\n\n"
-                                                f"Requested change:\n{request}"},
-                ], role="plan")
+                raw = self._pi_turn(_PLAN_REVISE_SYSTEM,
+                                    f"Plan:\n```yaml\n{before.to_yaml().strip()}\n```\n\n"
+                                    f"Tools (name: the settings it takes):\n{tools}\n\n"
+                                    + (f"{listing}\n\n" if listing else
+                                       "No list of datasets is available: name no dataset.\n\n"
+                                       if lookup else "")
+                                    + (f"{earlier}\n\n" if earlier else "")
+                                    + f"Requested change:\n{request}")
             except Exception as exc:  # noqa: BLE001 - a failed revision call is not a failed revision
                 emit({"type": "plan_revise_skipped", "why": f"{type(exc).__name__}: {exc}"[:200]})
+                return None
+            cannot = _cannot_reason(raw)
+            if cannot and refusals is not None:
+                emit({"type": "plan_revise_skipped", "why": "the reviser could not carry it out"})
+                refusals.append(cannot)
                 return None
             ops = parse_plan_ops(raw)
         if ops is None:
@@ -4083,6 +4560,19 @@ class ResearchLab:
             edited = apply_ops(before, ops)
         except PlanError as exc:
             emit({"type": "plan_revise_skipped", "why": "; ".join(exc.problems)[:300]})
+            return None
+        # A step that holds the reply nearly word for word was not changed as asked: the request was
+        # pasted in (the production case of #120: "look for the datasets again and write them into
+        # the plan" became step 2's text). Refused, never adopted.
+        old_text = {s.id: s.text for s in before.steps}
+        pasted = [i for i, s in enumerate(edited.steps, 1) if s.text != old_text.get(s.id)
+                  and any(copies_reply(s.text, said) for said in (request, reply) if said)]
+        if pasted:
+            emit({"type": "plan_revise_skipped", "why": f"step {pasted[0]} only repeated the request"})
+            if refusals is not None:
+                refusals.append(f"the change was not carried out: step {pasted[0]} would only have "
+                                "repeated your message. Say what the step should do, or edit it on the "
+                                "plan card.")
             return None
         # What the operations said about settings. A step the model reworded or added WITHOUT
         # giving settings gets them the way a drafted step does: the binder reads its new sentence,
@@ -4112,7 +4602,9 @@ class ResearchLab:
                 # The Scientist writes a code step's code; a plan that pins a snippet as its "setting"
                 # would hand it a program nobody reviewed as one (seen on the served model, 2026-10-14).
                 settings = {}
-            elif (reworded and not mine) or (old is None and not settings):
+            elif (reworded and step.id not in explicit) or (old is None and not settings):
+                # A step reworded with no word on its settings has them read from its new sentence.
+                # One whose operation gave them ({} included) is settled: no binding call (#122).
                 rebind.append(i)
             elif reworded and tool and schemas.get(tool):
                 carried = {k: v for k, v in settings.items() if k not in mine}
@@ -4124,10 +4616,13 @@ class ResearchLab:
                 step, tool=tool, settings=settings, tools=step.tools if tool == step.tool else ()))
         edited, findings = check_plan(PlanDoc(request=question, steps=tuple(steps)), schemas,
                                       is_known=lambda name: get_skill(name) is not None,
-                                      skill_name=_skill_name, before=before)
+                                      skill_name=_skill_name, before=before,
+                                      datasets=self._dataset_check())
         if findings:
-            emit({"type": "plan_revise_skipped", "why": "; ".join(
-                _PLAN_FINDING_WORDS.get(f["kind"], "{kind}").format(**f) for f in findings)[:300]})
+            why = "; ".join(_PLAN_FINDING_WORDS.get(f["kind"], "{kind}").format(**f) for f in findings)
+            emit({"type": "plan_revise_skipped", "why": why[:300]})
+            if refusals is not None and any(f["kind"] == "unknown_dataset" for f in findings):
+                refusals.append(why[:400] + ".")
             return None
         doc, changes, notes = apply_edit(before, edited)
         if not changes:
@@ -4168,6 +4663,38 @@ class ResearchLab:
         emit({"type": "plan_approved", "yaml": self._approved_plan.to_yaml(), "reviewed": reviewed,
               "pinned": sum(len(s.settings) for s in self._approved_plan.steps)})
 
+    def _plan_step_ref(self, text: str) -> "tuple[int | None, str]":
+        """The approved plan's number (1-based) and id of the step whose agenda text is ``text``;
+        ``(None, "")`` for a step the plan does not hold (one added or inserted during the run, or a
+        run with no plan document). Whitespace does not count, so a re-wrapped step still matches."""
+        doc = self._approved_plan or self._plan_doc
+        if doc is None:
+            return None, ""
+        flat = " ".join(str(text or "").split())
+        for i, s in enumerate(doc.steps, 1):
+            if s.text == text or " ".join(s.text.split()) == flat:
+                return i, s.id
+        return None, ""
+
+    def mark_step(self, emit: EventFn, text: str, state: str, *, index: "int | None" = None,
+                    reason: str = "") -> None:
+        """Say where one step of the plan stands: ``pending`` (added during the run, not started),
+        ``processing``, ``done`` (its result was accepted), ``failed`` (it ended without an accepted
+        result) or ``skipped`` (the plan review left it out). The console marks the step on both plan
+        cards from these (RCHENLAB/AiScientist#121); the gateway keeps the latest state of each step
+        with the run, so a reload and the saved run show the same marks."""
+        n, sid = self._plan_step_ref(text)
+        ev: dict[str, Any] = {"type": "step_state", "text": text, "state": state}
+        if n is not None:
+            ev["step"] = n
+        if sid:
+            ev["id"] = sid
+        if index is not None:
+            ev["index"] = index
+        if reason:
+            ev["reason"] = reason[:300]
+        emit(ev)
+
     def _assigned_skill(self, step: str) -> "Skill | None":
         """The skill the plan assigned to ``step`` (``skill:`` in the plan document), if it is still in
         the library; ``None`` otherwise. The approved plan when there is one, else the draft."""
@@ -4192,15 +4719,48 @@ class ResearchLab:
         return any(declares(s, "exploration") for s in self._step_skills(step))
 
     def _pinned_settings(self, step: str) -> "dict[str, dict[str, Any]]":
-        """``{tool: settings}`` the approved plan fixes for this step ({} when it fixes none)."""
+        """``{tool: settings}`` the approved plan fixes for this step ({} when it fixes none).
+
+        A setting that describes one library is not among them when the run's data holds several
+        (:meth:`_per_library_held`): one plan value cannot be right for every library."""
         if self._approved_plan is None:
             return {}
         found = self._approved_plan.step_for(step)
         if found is None or not found.tool:
             return {}
-        if not found.settings and self._scope.source != "explicit_mcp":
+        held = self._per_library_held(step)
+        settings = {k: v for k, v in found.settings.items() if k not in held}
+        if not settings and self._scope.source != "explicit_mcp":
             return {}
-        return {found.tool: dict(found.settings)}
+        return {found.tool: settings}
+
+    def _bound_libraries(self) -> "list[str]":
+        """The Cell Ranger libraries the run's data holds (their sample ids), as the run start
+        recognised them: every bound folder's, or the libraries inside one bound parent folder."""
+        decisions = self.ctx.decisions or {}
+        layout = decisions.get("cellranger_layout")
+        libs = [str(lib.get("sample") or "") for lib in ((layout or {}).get("libraries") or [])
+                if isinstance(lib, dict)] if isinstance(layout, dict) else []
+        folders = [f for f in decisions.get("input_folders") or [] if isinstance(f, dict)]
+        if len(libs) < len(folders):
+            libs = [str(f.get("name") or "") for f in folders]
+        return libs
+
+    def _per_library_held(self, step: str) -> "dict[str, Any]":
+        """The approved settings of ``step`` that are NOT applied to every call: those describing one
+        library (``per_library_settings``), when the run's data holds several libraries. The model
+        sets them per call, or leaves them out for the tool to read from each library. Run
+        6e5a33230a46: two mouse libraries and a human one, a plan that said species = human, and
+        that value forced onto every call. A plan whose arguments are the whole call (an explicitly
+        requested MCP call) keeps them all."""
+        if self._approved_plan is None or self._scope.source == "explicit_mcp":
+            return {}
+        found = self._approved_plan.step_for(step)
+        keys = per_library_settings(found.tool) if found is not None and found.tool else ()
+        if not keys or len(self._bound_libraries()) < 2:
+            return {}
+        # `auto` is right for every library (the tool reads each one), so it stays pinned.
+        return {k: v for k, v in found.settings.items() if k in keys and str(v).lower() != "auto"}
 
     def _check_plan_tooling(self, agenda: "list[str]", emit: EventFn,
                             already_reported: "set[str]") -> "list[str]":
@@ -4241,6 +4801,8 @@ class ResearchLab:
         idx, text = patched
         if _norm_step(text) == _norm_step(agenda[idx]):
             return None                      # nothing actually changed — let the redraft try
+        if copies_reply(text, request):
+            return None                      # the request pasted into the step is no patch (#120)
         out = [*agenda[:idx], text, *agenda[idx + 1:]]
         # Surface the edit as a DIFF. The whole failure this replaces was invisible: the plan came
         # back different and the UI showed no before/after, so a researcher could not tell that
@@ -4338,7 +4900,7 @@ class ResearchLab:
         # not be registered for the run at all, and a preset pipeline's guidance still names it.
         input_gaps = missing_inputs(None, self.ctx.decisions)
         tools_desc = "\n".join(
-            f"- {t.name}: {_planner_tool_description(t)}"
+            f"- {t.name}: {_planner_tool_description(t)}" + _planner_tool_settings(t)
             + (f" [CANNOT RUN IN THIS CHAT: {input_gaps[t.name]} Do not plan it.]"
                if t.name in input_gaps else "")
             for t in self.scientist.catalog if t.name != "finish"
@@ -4362,33 +4924,43 @@ class ResearchLab:
         if dataset_ctx:
             parts.append(dataset_ctx + "\n")
         parts.append(f"The scientist can run ONLY these tools (plan steps achievable with them):\n{tools_desc}\n")
+        if planning_note():
+            parts.append(planning_note() + "\n")
         # Read for every plan, so each request planned in full is matched against the skills as they
         # are now (including any induced since the last run), not only the one preset pipeline.
         skills_block = plan_skills_block(f"{question}\n{dataset_ctx or ''}")
         if skills_block:
             parts.append(skills_block + "\n")
+        revision: list[str] = []
         if prior_agenda:
             prev = "\n".join(f"{i + 1}. {s}" for i, s in enumerate(prior_agenda))
-            parts.append(f"Your previous draft plan was:\n{prev}\n")
+            revision.append(f"Your previous draft plan was:\n{prev}\n")
         if feedback:
-            parts.append(
+            revision.append(
                 "The user reviewed that plan and asked for these changes — revise the plan "
                 f"to satisfy them (keep what they did not object to):\n{feedback}\n"
             )
         if allow_clarify:
-            parts.append(
-                "If the request is genuinely ambiguous in a way that changes the plan, you MAY "
-                "return a clarify object instead (see your instructions). Otherwise return the agenda."
-            )
+            ask = ("If the request is genuinely ambiguous in a way that changes the plan, you MAY "
+                   "return a clarify object instead (see your instructions). Otherwise return the agenda.")
         else:
-            parts.append("Return the ordered agenda now.")
+            ask = "Return the ordered agenda now."
 
-        messages = [
-            {"role": "system", "content": self._name_literature_tool(_PI_SYSTEM)},
-            {"role": "user", "content": "\n".join(parts)},
-        ]
+        # The plan phase's conversation (#122): the first draft starts it, with everything above as
+        # its fixed prefix; a redraft is a turn of it, so the PI keeps what it already read and every
+        # turn reads that prefix from the cache.
+        convo = self._plan_conversation if self.config.plan_conversation else None
+        if convo is not None and convo.answered and revision:
+            messages = convo.ask("\n".join([*revision, ask + " Reply with the same JSON object as your "
+                                                            "first plan, `plan_steps` included."]))
+        else:
+            messages = [
+                {"role": "system", "content": self._name_literature_tool(_PI_SYSTEM)},
+                {"role": "user", "content": "\n".join([*parts, *revision, ask])},
+            ]
         raw = self._complete(messages, role="plan")
         self._save_plan_reply(raw)
+        sent = [*messages, {"role": "assistant", "content": raw or ""}]
         parsed = _parse_plan(raw, self.config.max_steps, allow_clarify)
         if parsed is None:
             # The reply is not a plan: prose around it, a JSON object that does not parse, or a reply
@@ -4404,9 +4976,13 @@ class ResearchLab:
                 emit({"type": "plan_reformat_failed", "error": f"{type(exc).__name__}: {exc}"[:200]})
                 retry = ""
             self._save_plan_reply(retry)
+            sent = [*again, {"role": "assistant", "content": retry or ""}]
             parsed = _parse_plan(retry, self.config.max_steps, allow_clarify)
             if parsed is not None:
                 raw = retry
+        if self.config.plan_conversation and parsed is not None:
+            self._plan_conversation = PlanConversation(sent)
+            self._drafted.update(_drafted_steps(raw))
         if parsed is None:
             # No plan. The question used to go in as the only step of a fallback plan, which the
             # reviewer could run as if the PI had written it (run 3ed7676de128 did, and no skill or
@@ -5134,6 +5710,7 @@ class ResearchLab:
         # schemas, but naming the tools here steers the model toward the curated analysis line
         # instead of reinventing it in run_code).
         tool_names = ", ".join(t.name for t in self.scientist.catalog if t.name != "finish")
+        code_on = model_written_code()
         parts.append(
             "Tools you can call: " + tool_names + ". Prefer the purpose-built analysis tools for "
             "standard steps; use run_code ONLY for analysis none of the tools cover — and never to "
@@ -5141,6 +5718,11 @@ class ResearchLab:
             "a `write_report` step of its own). Data you "
             "prepared with run_code goes to a tool through its `input` parameter (a file in "
             "AISCIENTIST_WORK) — do not re-implement the tool's analysis in code to use it."
+            if code_on else
+            "Tools you can call: " + tool_names + ". This deployment runs no code you write: there "
+            "is no run_code, run_shell or run_in_environment, not even to check a file (the lookups "
+            "read files). Carry out the step with these tools. If none of them does what the step "
+            "needs, call `finish` and say so plainly: never approximate the analysis another way."
         )
         # Atomic SKILLS by PROGRESSIVE DISCLOSURE: the brief lists EVERY skill's name + description
         # (no cap — the agent reads the whole list before it chooses), never the bodies or code;
@@ -5152,7 +5734,9 @@ class ResearchLab:
         # or shell commands inline there, a longer one bundles files (reference.py, scripts/...).
         has_shell = any(t.name == "run_shell" for t in self.scientist.catalog)
         _run = ("run Python with run_code and shell commands with run_shell" if has_shell else
-                "run it with run_code (shell commands too, through subprocess inside the snippet)")
+                "run it with run_code (shell commands too, through subprocess inside the snippet)"
+                if code_on else
+                "follow it with the tools above: its code cannot run here, so use it as guidance only")
         _fetch = ("call `read_skill_reference(name)` for its SKILL.md — the guidance, which may itself "
                   "hold the code or commands — and its list of bundled files; fetch a bundled file "
                   "with `read_skill_reference(name, file=...)`. Adapt it to THIS dataset, then "
@@ -5188,6 +5772,36 @@ class ResearchLab:
                    ". These values are applied to the call whatever you send; every other argument is yours to choose. ")
                 + "If a result shows one of them is wrong for this data, say so in "
                 "your answer — changing an approved value is the researcher's decision.")
+        # The data the approved plan says this step reads (RCHENLAB/AiScientist#120).
+        planned = self._approved_plan or self._plan_doc
+        found = planned.step_for(plan_step if plan_step is not None else step) if planned is not None else None
+        if found is not None and found.dataset:
+            parts.append(f"The approved plan says this step reads {plan_datasets.describe(found.dataset)}"
+                         + (" (a shared dataset)" if found.dataset.get("source") == "shared" else "")
+                         + ". Read that data: when it is not the run's main dataset, it is one of the "
+                           "other attached inputs (AISCIENTIST_INPUTS).")
+        held = self._per_library_held(plan_step if plan_step is not None else step)
+        if held:
+            libs = self._bound_libraries()
+            parts.append(
+                "The plan also gives " + ", ".join(f"{k}={json.dumps(v)}" for k, v in held.items())
+                + f" for this step. This run's data holds {len(libs)} libraries ("
+                + ", ".join(libs[:6]) + (" …" if len(libs) > 6 else "") + "), and "
+                + ("that setting describes one library, so it is" if len(held) == 1
+                   else "those settings describe one library, so they are")
+                + " NOT applied to every call. One call can QC libraries of several species: leave "
+                "`species` and `chemistry` out (or send \"auto\") and CellQC reads them from each "
+                "library and QCs each species on its own. Set a value only in a call whose libraries "
+                "it is true of.")
+            key = plan_step if plan_step is not None else step
+            said = getattr(self, "_per_library_said", None)
+            if said is None:
+                said = self._per_library_said = set()
+            if key not in said:        # once per step, not on every attempt
+                said.add(key)
+                held_step = self._approved_plan.step_for(key)
+                emit({"type": "plan_setting_per_library", "tool": held_step.tool if held_step else "",
+                      "settings": held, "libraries": libs})
         parts.append("Execute THIS step with the tools, then call `finish` with what you found for this step.")
         brief = "\n\n".join(parts)
         emit({"type": "scientist_start", "step": step, "specialist": specialist.name})
@@ -5739,6 +6353,9 @@ class ResearchLab:
             key = _norm_step(text)
             if not key or key in existing or _is_report_busywork(text):
                 continue
+            if code_gate.code_step(text):
+                emit({"type": "steps_pruned", "reason": "model_written_code", "dropped": [text]})
+                continue
             h = self._ledger.find(str(item.get("hypothesis", "")))
             if h is None:   # orphan step — no hypothesis behind it, so no reason to spend a step on it
                 continue
@@ -5831,6 +6448,8 @@ class ResearchLab:
             scope_note["request_breadth"] = self._request_breadth
         if self.config.prior_work:
             scope_note["earlier_work"] = self.config.prior_work
+        if planning_note():
+            scope_note["model_written_code"] = planning_note()
         raw_critic = self._complete([
             {"role": "system", "content": _PLAN_REVIEW_CRITIC_SYSTEM},
             {"role": "user", "content": json.dumps(
@@ -5849,13 +6468,23 @@ class ResearchLab:
                                  if str(s).strip()], [t.name for t in self.scientist.catalog])
         if not issues and (not proposed or proposed == agenda):
             return agenda   # Critic found nothing wrong → no PI round, plan unchanged
-        pi = _parse_verdict(self._complete([
-            {"role": "system", "content": _PLAN_REVIEW_PI_SYSTEM},
-            {"role": "user", "content": json.dumps(
-                {"research_question": question, "dataset_profile": profile, "draft_agenda": agenda,
-                 "tools_named_in_plan": contracts, **scope_note,
-                 "critic_issues": issues, "critic_revised_agenda": proposed})},
-        ], role="plan")) or {}
+        # ONE pass (RCHENLAB/AiScientist#122): the Critic reads the draft once, and the PI's round is
+        # the only other call, made only because the Critic reported a problem. A missing primary
+        # analysis is put to the PI in that round, not in a third call after it.
+        _missing = _missing_analysis_family(issues) if issues else None
+        review = {"draft_agenda": agenda, "tools_named_in_plan": contracts, **scope_note,
+                  "critic_issues": issues, "critic_revised_agenda": proposed}
+        if _missing:
+            review["unresolved"] = (f"The Critic reported that the plan is missing an analysis that none "
+                                    f"of your steps computes. Unless you are sure it is not needed, add a "
+                                    f"step that calls one of {list(_missing)}, keeping every other step "
+                                    f"you decide on.")
+        if not self._in_conversation:
+            # A call of its own also needs what the conversation already holds.
+            review = {"research_question": question, "dataset_profile": profile, **review}
+        raw_pi = self._pi_turn(_PLAN_REVIEW_PI_SYSTEM, json.dumps(review))
+        pi = _parse_verdict(raw_pi) or {}
+        self._drafted.update(_drafted_steps(raw_pi, key="final_agenda"))
         tool_names = [t.name for t in self.scientist.catalog]
         final = retick_tools([str(s).strip() for s in (pi.get("final_agenda") or [])
                               if str(s).strip()], tool_names)
@@ -5884,28 +6513,14 @@ class ResearchLab:
         # repair rate (prompt wording, then this control flow) all measured 50-67% on n<=12, which
         # at a ~50% base rate is one distribution, not four. It does NOT reliably repair the plan.
         # What it does change is categorical: before it, every unrepaired plan shipped silently;
-        # now 5 of 6 emit ``plan_review_unresolved``. The retry is kept because it is bounded to
-        # one call and its fallback (the Critic's own revision) is strictly more consistent with
-        # the issue raised than the PI's answer that ignored it — not because it was shown to lift
-        # the rate. If you touch this, measure on n in the hundreds or do not claim a change.
-        _missing = _missing_analysis_family(issues) if issues else None
+        # now 5 of 6 emit ``plan_review_unresolved``. The insistence that used to be a retry after
+        # the PI's round is now part of that round (``unresolved``), so the review stays one pass
+        # (#122); the fallback (the Critic's own revision) is kept because it is strictly more
+        # consistent with the issue raised than a PI answer that ignored it — not because it was
+        # shown to lift the rate. If you touch this, measure on n in the hundreds or do not claim a
+        # change.
         if _missing and not _names_tool(final, _missing):
-            retry = _parse_verdict(self._complete([
-                {"role": "system", "content": _PLAN_REVIEW_PI_SYSTEM},
-                {"role": "user", "content": json.dumps(
-                    {"research_question": question, "dataset_profile": profile,
-                     "draft_agenda": agenda, **scope_note, "critic_issues": issues,
-                     "critic_revised_agenda": proposed,
-                     "unresolved": f"The Critic reported that the plan is missing an analysis "
-                                   f"that none of your steps computes. Add a step that calls one "
-                                   f"of {list(_missing)}, keeping every other step you already "
-                                   f"decided on."})},
-            ], role="plan")) or {}
-            second = retick_tools([str(x).strip() for x in (retry.get("final_agenda") or [])
-                                   if str(x).strip()], tool_names)
-            if second and len(second) <= self.config.max_steps and _names_tool(second, _missing):
-                final = second
-            elif _names_tool(proposed, _missing) and len(proposed) <= self.config.max_steps:
+            if _names_tool(proposed, _missing) and len(proposed) <= self.config.max_steps:
                 final = proposed
             else:
                 emit({"type": "plan_review_unresolved", "issues": issues, "agenda": list(final),

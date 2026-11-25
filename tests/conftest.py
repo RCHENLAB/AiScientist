@@ -105,6 +105,41 @@ def cellqc_release(skill_release):
     return skill_release(FIXTURE_SKILLS)
 
 
+# Test modules written for the lab as it ran before RCHENLAB/AiScientist#150, with model-written code
+# allowed: their plans use placeholder steps that name no tool, or their tools are run_code and its
+# family. They test machinery the switch does not change, so they run with the switch on, which is
+# what turning it on restores; tests/test_model_written_code_switch.py tests both positions.
+CODE_ON_MODULES = frozenset({
+    "test_context_budget", "test_execution_fixes", "test_harness_timing", "test_hpc_shell_wiring",
+    "test_hypothesis_exploration", "test_lab_graph", "test_lab_local_integration",
+    "test_midrun_checkpoint", "test_multi_cycle", "test_plan_mode_question", "test_plan_provenance",
+    "test_plan_skills", "test_plan_yaml_flow", "test_preset_compose", "test_registry",
+    "test_request_bound_plan", "test_research_lab", "test_research_lab_resume",
+    "test_resume_interrupted", "test_run_in_environment", "test_saved_plan_lab", "test_skill_induction",
+    "test_skill_outputs", "test_slurm_analysis", "test_step_meetings", "test_step_numbers",
+    "test_system_info", "test_team_meeting_stop", "test_tool_result_truncation",
+    "test_untested_code_and_skill_requests", "test_environment_manifest",
+})
+
+
+@pytest.fixture
+def model_written_code(monkeypatch):
+    """Model-written code turned on (``AISCIENTIST_MODEL_WRITTEN_CODE=1``): the code tools are offered
+    and plans may name them, as before RCHENLAB/AiScientist#150."""
+    monkeypatch.setenv("AISCIENTIST_MODEL_WRITTEN_CODE", "1")
+
+
+@pytest.fixture(autouse=True)
+def model_written_code_default(request, monkeypatch):
+    """Every test starts from the deployment default, off (whatever the shell running the tests has
+    set); a module in ``CODE_ON_MODULES`` runs with it on."""
+    monkeypatch.delenv("AISCIENTIST_MODEL_WRITTEN_CODE", raising=False)
+    monkeypatch.delenv("BIOAGENT_MODEL_WRITTEN_CODE", raising=False)
+    module = getattr(request.module, "__name__", "").rsplit(".", 1)[-1]
+    if module in CODE_ON_MODULES:
+        monkeypatch.setenv("AISCIENTIST_MODEL_WRITTEN_CODE", "1")
+
+
 @pytest.fixture(autouse=True)
 def no_account_storage_limit(monkeypatch):
     """The per-account limit (issue 74) is off unless a test turns it on: it reads the account's
@@ -132,7 +167,8 @@ def lab_gateway(tmp_path, monkeypatch):
     monkeypatch.setenv("AISCIENTIST_MAX_RUNS_PER_SESSION", "3")
 
     def complete(messages, **kwargs):
-        system = messages[0]["content"]
+        from plan_turns import instruction
+        system = instruction(messages)
         models.append(system)
         if "Principal Investigator of a bioinformatics lab" in system:
             return json.dumps({"agenda": ["Filter cells with `mcp_run_scanpy_qc` at max_pct_mt 20."]})

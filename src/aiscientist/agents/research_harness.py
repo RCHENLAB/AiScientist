@@ -33,6 +33,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
+from .code_policy import refusal as code_refusal
 from .loop_utils import CheckpointWriter, safe_json_loads
 from .plan_doc import pin_args
 from ..integrations.biomni_adapter import BiomniAdapter
@@ -465,6 +466,16 @@ class ResearchHarness:
                         errors.append({"tool": name, "error": validation_error})
                         emit({"type": "tool_error", "tool": name, "error": validation_error})
                         self._feed_result(messages, native, call.get("id"), {"error": validation_error})
+                        if code_refusal(name):
+                            # A refused code tool counts as a failed call (issue 150): the same
+                            # refusal again is a stuck model, and after a result a wasted turn, so a
+                            # model that keeps asking for run_code ends on what it has instead of
+                            # spending the whole step on refusals.
+                            sig = f"refused:{name}"
+                            repeated_errors = repeated_errors + 1 if sig == last_error_sig else 1
+                            last_error_sig = sig
+                            if had_success:
+                                wasted_after_success += 1
                         continue
                     bad_calls = 0
 
@@ -530,8 +541,13 @@ class ResearchHarness:
                         last_error_sig = sig
                         if had_success:
                             wasted_after_success += 1
-                        # Feed the error back so the model can adapt or report it.
-                        self._feed_result(messages, native, call.get("id"), {"error": error_text})
+                        # Feed the error back so the model can adapt or report it — with the approved
+                        # values that replaced its own, as on success: the call that failed is the
+                        # one that ran, not the one it wrote.
+                        self._feed_result(messages, native, call.get("id"), {
+                            **({"approved_settings_applied": {e["param"]: e["approved"] for e in enforced}}
+                               if enforced else {}),
+                            "error": error_text})
                         continue
 
                     # A cancellable tool (run_code) scancelled/killed itself because Stop fired —
@@ -686,6 +702,11 @@ class ResearchHarness:
     def _validate_call(self, call: dict[str, Any]) -> tuple[str | None, dict[str, Any], str | None]:
         function = (call or {}).get("function") or {}
         name = function.get("name")
+        # Refused at dispatch, whoever offered the tool: model-written code is a deployment switch
+        # (agents/code_policy.py), and a tool added to the harness later must not reopen it.
+        refused = code_refusal(name)
+        if refused:
+            return name, {}, refused
         if name not in self._by_name:
             return name, {}, f"unknown tool '{name}'"
         raw = function.get("arguments")

@@ -24,6 +24,11 @@ its prose (``does``) and gains the structured facts beside it::
 AiScientist when the plan is drafted, shown on the card, removable, and handed to the Scientist
 with its guidance and code when the step runs.
 
+``dataset`` names the data a step reads: the dataset's ``name``, and for a shared dataset its
+``version`` and the member ``file``. It is checked against the datasets the researcher can use, and
+a dataset chosen while the plan is reviewed is attached to the chat when the plan is approved, so
+the run reads that one.
+
 ``settings`` are the tool arguments the plan fixes. They are passed to the tool as written
 (``pinned`` in the harness), so an approved number is the number that runs; ``check_adherence``
 reads a finished run back against the approved document.
@@ -44,6 +49,12 @@ from .tool_schema import NAME_LEFT, NAME_RIGHT, PlanParameters
 
 PLAN_VERSION = 1
 
+#: What a step's ``dataset`` says, in the order the document writes it. ``name`` is the dataset's name
+#: (the researcher's own upload, or a shared dataset); ``version`` and ``file`` are a shared dataset's
+#: version label and member file. ``source`` (``own`` / ``shared``) and ``id`` (the upload's UUID, the
+#: shared dataset's slug) are filled in by AiScientist when the name is checked.
+DATASET_FIELDS = ("name", "version", "file", "source", "id")
+
 #: Tools that run code the model writes. A plan step that names one has no fixed operation to
 #: describe, so the plan says so instead of naming a pipeline tool.
 CODE_TOOLS = frozenset({"run_code", "run_shell", "run_in_environment"})
@@ -52,6 +63,7 @@ _HEADER = (
     "# AiScientist plan. Run it as it is, or edit it and choose \"Apply edits\".\n"
     "# `settings` are passed to the step's tool exactly as written here.\n"
     "# `skill` is the vetted skill a step uses; delete the line to let the step go without it.\n"
+    "# `dataset` is the data a step reads: its name, and a shared dataset's version and file.\n"
     "# `tools` lists planned tool/provider/version identities; `skills` lists planned skill versions.\n"
     "# Assignment is not evidence that a tool or skill ran successfully.\n"
     "# `request` and `runs_on` are filled in by AiScientist; changes to them are ignored.\n"
@@ -108,6 +120,8 @@ class PlanStep:
     skill: "str | None" = None
     tools: "tuple[dict[str, str], ...]" = ()
     skills: "tuple[dict[str, str], ...]" = ()
+    #: The data the step reads (keys from ``DATASET_FIELDS``), or ``None`` when the plan does not say.
+    dataset: "dict[str, str] | None" = None
 
     def planned_tools(self) -> "list[dict[str, str]]":
         return [dict(t) for t in self.tools] if self.tools else ([{
@@ -138,6 +152,8 @@ class PlanStep:
             out["skill"] = self.skill
         out["tools"] = self.planned_tools()
         out["skills"] = self.planned_skills()
+        if self.dataset:
+            out["dataset"] = dict(self.dataset)
         return out
 
 
@@ -271,6 +287,10 @@ def dump_plan_yaml(doc: PlanDoc) -> str:
             out.append(f"    tools: {_scalar(list(step.tools))}")
         if step.skills:
             out.append(f"    skills: {_scalar(list(step.skills))}")
+        if step.dataset:
+            out.append("    dataset:")
+            out.extend(f"      {k}: {_scalar(str(step.dataset[k]))}" for k in DATASET_FIELDS
+                       if step.dataset.get(k))
         if step.settings:
             out.append("    settings:")
             out.extend(f"      {_scalar(str(k))}: {_scalar(v)}" for k, v in step.settings.items())
@@ -318,6 +338,30 @@ def _identities(raw: Any, *, tools: bool = False) -> tuple[dict[str, str], ...]:
             row.update(provider=provider, server=str(item.get("server") or "unknown"))
         result.append(row)
     return tuple(result)
+
+
+def dataset_ref(raw: Any) -> "dict[str, str] | None":
+    """A step's ``dataset`` as written: a name alone, or a mapping of ``DATASET_FIELDS``. ``None`` for
+    nothing (no key, ``null``, an empty name). Raises :class:`PlanError` for a value that names no
+    dataset or carries a field the plan does not know, so an edit never drops it without a word."""
+    if raw is None or raw == "" or raw == {}:
+        return None
+    if isinstance(raw, str):
+        name = _flat(raw)
+        return {"name": name} if name else None
+    if not isinstance(raw, Mapping):
+        raise PlanError(["A step's dataset must be a name, or a name with its version and file."])
+    unknown = [str(k) for k in raw if k not in DATASET_FIELDS]
+    if unknown:
+        raise PlanError([f"A step's dataset has no field `{unknown[0]}` (it takes: "
+                         + ", ".join(DATASET_FIELDS[:3]) + ")."])
+    ref = {k: _flat(str(raw[k])) for k in DATASET_FIELDS
+           if raw.get(k) is not None and _flat(str(raw[k]))}
+    if not ref.get("name") and not ref.get("id"):
+        if not ref:
+            return None
+        raise PlanError(["A step's dataset needs the dataset's name."])
+    return ref
 
 
 def parse_plan_yaml(text: str, *, request: str = "") -> PlanDoc:
@@ -389,8 +433,13 @@ def parse_plan_yaml(text: str, *, request: str = "") -> PlanDoc:
                         settings[str(key)] = value
         if settings and not tool:
             problems.append(f"Step {n} has settings but no tool selected to use them.")
+        try:
+            dataset = dataset_ref(raw.get("dataset"))
+        except PlanError as exc:
+            problems.extend(f"Step {n}: {p}" for p in exc.problems)
+            dataset = None
         parsed.append({"id": sid, "title": title, "does": does, "tool": tool, "settings": settings,
-                       "skill": skill, "tools": tools, "skills": skills})
+                       "skill": skill, "tools": tools, "skills": skills, "dataset": dataset})
     if problems:
         raise PlanError(problems)
 
@@ -400,7 +449,7 @@ def parse_plan_yaml(text: str, *, request: str = "") -> PlanDoc:
         seen.add(sid)
         steps.append(PlanStep(id=sid, text=join_step(item["title"], item["does"]),
                               tool=item["tool"], settings=item["settings"], skill=item["skill"],
-                              tools=item["tools"], skills=item["skills"]))
+                              tools=item["tools"], skills=item["skills"], dataset=item["dataset"]))
     return PlanDoc(request=request, steps=tuple(steps))
 
 
@@ -443,7 +492,9 @@ def sync_plan(prev: "PlanDoc | None", agenda: "list[str]", *, request: str,
             sid = inherited or _fresh_id(used)
             used.add(sid)
             kept_ids.add(sid)
-            step = PlanStep(id=sid, text=text, tool=tool_of(text))
+            # The step rewritten in place still reads the data the plan named for it.
+            step = PlanStep(id=sid, text=text, tool=tool_of(text),
+                            dataset=prev_steps[i].dataset if inherited else None)
             fresh.append(i)
         if runs_on_of is not None and step.tool:
             step = replace(step, runs_on=runs_on_of(step.tool) or "")
@@ -638,21 +689,52 @@ def _edited_primary_tool(step: PlanStep, old: "PlanStep | None") -> PlanStep:
     return step
 
 
+DatasetCheck = Callable[[Mapping[str, str]], "tuple[dict[str, str] | None, str]"]
+
+
 def check_plan(doc: PlanDoc, schemas: "Mapping[str, Mapping[str, Any]]",
                is_known: "Callable[[str], bool] | None" = None,
                skill_name: "Callable[[str], str | None] | None" = None,
                *, before: "PlanDoc | None" = None,
+               datasets: "DatasetCheck | None" = None,
                ) -> "tuple[PlanDoc, list[dict[str, Any]]]":
     """``(doc with settings in their declared types, findings)`` for a document a person edited.
 
     Findings are ``{kind, step, id, tool, param, detail}``. ``unknown_tool``, ``unknown_setting``,
-    ``bad_value`` and ``unknown_skill`` are errors — the run would fail on them, or run with a value
-    the tool rejects — and the caller refuses the edit. An empty ``schemas`` yields no tool
-    findings: with no catalog there is nothing to judge against.
+    ``bad_value``, ``unknown_skill`` and ``unknown_dataset`` are errors — the run would fail on
+    them, or run with a value the tool rejects, or read data that is not there — and the caller
+    refuses the edit. An empty ``schemas`` yields no tool findings: with no catalog there is nothing
+    to judge against.
 
     ``skill_name`` resolves a step's ``skill`` to the library's own name (an old name of a migrated
     skill resolves too), or ``None`` when no such skill is loaded. ``before`` settles a tools-only
-    edit's primary tool before validating its settings, using the same rule as ``apply_edit``."""
+    edit's primary tool before validating its settings, using the same rule as ``apply_edit``.
+    ``datasets`` checks a step's ``dataset`` against the datasets the researcher can use: it gives
+    the dataset as the catalogue names it, or ``(None, why)`` (``plan_datasets.checker``). Without
+    it a step's dataset is not judged."""
+    found: list[dict[str, Any]] = []
+    if datasets is not None:
+        checked: list[PlanStep] = []
+        for n, step in enumerate(doc.steps, 1):
+            if step.dataset:
+                ref, why = datasets(step.dataset)
+                if ref is None:
+                    found.append({"step": n, "id": step.id, "tool": step.tool or "", "kind": "unknown_dataset",
+                                  "param": step.dataset.get("name") or step.dataset.get("id") or "",
+                                  "detail": why})
+                elif ref != step.dataset:
+                    step = replace(step, dataset=ref)
+            checked.append(step)
+        doc = PlanDoc(request=doc.request, steps=tuple(checked))
+    doc, findings = _check_plan(doc, schemas, is_known, skill_name, before=before)
+    return doc, found + findings
+
+
+def _check_plan(doc: PlanDoc, schemas: "Mapping[str, Mapping[str, Any]]",
+                is_known: "Callable[[str], bool] | None" = None,
+                skill_name: "Callable[[str], str | None] | None" = None,
+                *, before: "PlanDoc | None" = None,
+                ) -> "tuple[PlanDoc, list[dict[str, Any]]]":
     if before is not None:
         old_by_id = {s.id: s for s in before.steps}
         doc = PlanDoc(request=doc.request, steps=tuple(
@@ -681,7 +763,7 @@ def check_plan(doc: PlanDoc, schemas: "Mapping[str, Mapping[str, Any]]",
             resolved.append(step)
         doc = PlanDoc(request=doc.request, steps=tuple(resolved))
         if skill_findings:
-            later_doc, later = check_plan(doc, schemas, is_known)
+            later_doc, later = _check_plan(doc, schemas, is_known)
             return later_doc, skill_findings + later
     if not schemas:
         return doc, []
@@ -822,6 +904,10 @@ def apply_edit(before: PlanDoc, edited: PlanDoc) -> "tuple[PlanDoc, list[dict[st
                 changes.append({"kind": field_name, "step": n, "id": step.id,
                                 "before": list(getattr(old, field_name)),
                                 "after": list(getattr(step, field_name))})
+        if (step.dataset or None) != (old.dataset or None):
+            changes.append({"kind": "dataset", "step": n, "id": step.id,
+                            "before": dict(old.dataset) if old.dataset else None,
+                            "after": dict(step.dataset) if step.dataset else None})
         for key in [*old.settings, *(k for k in step.settings if k not in old.settings)]:
             was, now = old.settings.get(key, _ABSENT), step.settings.get(key, _ABSENT)
             if was is not _ABSENT and now is not _ABSENT and _same_value(was, now):
@@ -846,11 +932,13 @@ def apply_edit(before: PlanDoc, edited: PlanDoc) -> "tuple[PlanDoc, list[dict[st
         unchanged = (text == old.text and (step.tool or None) == (old.tool or None)
                      and (step.skill or None) == (old.skill or None)
                      and step.tools == old.tools and step.skills == old.skills
+                     and (step.dataset or None) == (old.dataset or None)
                      and _settings_equal(step.settings, old.settings))
         steps.append(old if unchanged else PlanStep(
             id=step.id, text=text, tool=step.tool, settings=dict(step.settings),
             runs_on=old.runs_on if (step.tool or None) == (old.tool or None) else "",
-            skill=step.skill or None, tools=step.tools, skills=step.skills))
+            skill=step.skill or None, tools=step.tools, skills=step.skills,
+            dataset=dict(step.dataset) if step.dataset else None))
     kept = {s.id for s in edited.steps}
     for s in before.steps:
         if s.id not in kept:
@@ -901,9 +989,10 @@ def apply_ops(doc: PlanDoc, ops: "Iterable[Mapping[str, Any]]") -> PlanDoc:
     applied in that case.
 
     A step is named by its ``id``; its 1-based number in ``doc`` is accepted too. ``change`` sets
-    any of ``title``, ``does``, ``tool`` and ``settings`` (merged into the step's settings; a
-    ``null`` value removes one). ``add`` and ``move`` place a step ``after`` another, or first with
-    ``after: "start"``; ``add`` without ``after`` appends."""
+    any of ``title``, ``does``, ``tool``, ``dataset`` and ``settings`` (merged into the step's
+    settings; a ``null`` value removes one; ``"dataset": null`` removes the step's dataset). ``add``
+    and ``move`` place a step ``after`` another, or first with ``after: "start"``; ``add`` without
+    ``after`` appends."""
     steps = list(doc.steps)
     numbered = {str(i): s.id for i, s in enumerate(doc.steps, 1)}
     used = {s.id for s in steps}
@@ -916,6 +1005,16 @@ def apply_ops(doc: PlanDoc, ops: "Iterable[Mapping[str, Any]]") -> PlanDoc:
             return ids.index(key)
         key = numbered.get(key.lstrip("#"), "")
         return ids.index(key) if key in ids else None
+
+    def data(op: Mapping[str, Any], n: int, current: "dict[str, str] | None") -> "tuple[dict[str, str] | None, bool]":
+        """The step's dataset after ``op`` (no ``dataset`` key leaves it), and whether it could be read."""
+        if "dataset" not in op:
+            return current, True
+        try:
+            return dataset_ref(op["dataset"]), True
+        except PlanError as exc:
+            problems.extend(f"Operation {n}: {p}" for p in exc.problems)
+            return current, False
 
     def place(ref: Any, n: int) -> "int | None":
         """Where a step goes for ``after: ref`` — an index into ``steps`` — or None (reported)."""
@@ -942,6 +1041,9 @@ def apply_ops(doc: PlanDoc, ops: "Iterable[Mapping[str, Any]]") -> PlanDoc:
             if settings not in (None, {}) and not isinstance(settings, Mapping):
                 problems.append(f"Operation {n}: `settings` must be a mapping of name to value.")
                 continue
+            dataset, ok = data(op, n, None)
+            if not ok:
+                continue
             at = len(steps) if "after" not in op or op.get("after") is None else place(op.get("after"), n)
             if at is None:
                 continue
@@ -952,7 +1054,7 @@ def apply_ops(doc: PlanDoc, ops: "Iterable[Mapping[str, Any]]") -> PlanDoc:
             steps.insert(at, PlanStep(id=sid, text=join_step(title, does), tool=tool,
                                       settings={str(k): v for k, v in (settings or {}).items() if v is not None},
                                       skill=skill, tools=_identities(op.get("tools"), tools=True),
-                                      skills=_identities(op.get("skills"))))
+                                      skills=_identities(op.get("skills")), dataset=dataset))
             continue
         at = find(op.get("step"))
         if at is None:
@@ -975,6 +1077,9 @@ def apply_ops(doc: PlanDoc, ops: "Iterable[Mapping[str, Any]]") -> PlanDoc:
             if new is not None and not isinstance(new, Mapping):
                 problems.append(f"Operation {n}: `settings` must be a mapping of name to value.")
                 continue
+            dataset, ok = data(op, n, step.dataset)
+            if not ok:
+                continue
             settings = dict(step.settings)
             for key, value in (new or {}).items():
                 if value is None:
@@ -996,7 +1101,8 @@ def apply_ops(doc: PlanDoc, ops: "Iterable[Mapping[str, Any]]") -> PlanDoc:
                                  tools=_identities(op["tools"], tools=True) if "tools" in op else (
                                      step.tools if tool == step.tool else ()),
                                  skills=_identities(op["skills"]) if "skills" in op else (
-                                     step.skills if skill == step.skill and op.get("skill", True) is not None else ()))
+                                     step.skills if skill == step.skill and op.get("skill", True) is not None else ()),
+                                 dataset=dataset)
     if not problems and not steps:
         problems.append("The operations remove every step. To run nothing, cancel the plan instead.")
     if problems:
@@ -1034,11 +1140,14 @@ def provider_changed(approved: Mapping[str, Any], used: Any) -> bool:
 
 
 def check_adherence(doc: PlanDoc, executed: "list[dict[str, Any]]",
-                    approved_additions: "Iterable[str]" = ()) -> "dict[str, Any]":
+                    approved_additions: "Iterable[str]" = (),
+                    per_call: "Mapping[str, Iterable[str]] | None" = None) -> "dict[str, Any]":
     """What the run did with each approved step.
 
     ``executed`` is the run's rounds in order: ``{"step": text, "accepted": bool, "calls":
-    [{"tool", "args", "ok"}]}``. Each approved step gets one status:
+    [{"tool", "args", "ok"}]}``. ``per_call`` (``{step id: settings}``) names a step's settings that
+    were not applied to every call, because each call sets them for its own libraries: they are
+    listed on the step's row (``per_call``), not compared. Each approved step gets one status:
 
     * ``as_planned``       — it ran, its tool was called and every approved setting was used
     * ``not_run``          — no round executed it (pruned, skipped, or the run stopped first)
@@ -1087,7 +1196,11 @@ def check_adherence(doc: PlanDoc, executed: "list[dict[str, Any]]",
                 rows.append(row)
                 continue
             differ: list[dict[str, Any]] = []
+            own = set((per_call or {}).get(step.id, ()))
             for key, approved in step.settings.items():
+                if key in own:
+                    row.setdefault("per_call", {})[key] = approved
+                    continue
                 used = [(c.get("args") or {}).get(key, _ABSENT) for c in good]
                 if not any(u is not _ABSENT and _same_value(u, approved) for u in used):
                     seen = next((u for u in used if u is not _ABSENT), None)

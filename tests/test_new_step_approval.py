@@ -80,7 +80,9 @@ def test_an_ordinary_decision_point_keeps_its_own_timeout_meaning():
     node = SimpleNamespace(id="s2", goal="Use the labels or re-cluster?", options=("a", "b"))
     out = gw_app._decision_review(conn, lambda _l, _s, msg: said.append(msg), node, timeout=0.05)
     assert out == {"action": "proceed", "timed_out": True}
-    assert any("agent's judgment" in m for m in said) and [p["type"] for p in pushed] == ["decision_prompt"]
+    assert any("agent's judgment" in m for m in said)
+    # Its card is closed too: the run no longer waits for it, so none of its options may be clicked.
+    assert [p["type"] for p in pushed] == ["decision_prompt", "plan_done"]
 
 
 @pytest.mark.parametrize("decision,words", [

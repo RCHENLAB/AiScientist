@@ -32,10 +32,11 @@ The remaining platform tools use `TOOL.md` manifests and `tools/catalog.py`; the
 [index](../src/aiscientist/tools/README.md) is generated from those manifests. The app
 retains staging, metadata, report and CodeAct infrastructure, not copies of the migrated
 scientific algorithms.
-The platform adds its own tools to that list: `finish`, `run_code` (the sandbox every skill runs
-in), the HPC3 shell tools when the session has a shell, `describe_environment`, and the tools that
-read the other layers (`read_skill_reference`, `search_skills`, `read_tool_source`,
-`run_in_environment`).
+The platform adds its own tools to that list: `finish`, the HPC3 shell tools when the session has a
+shell, `describe_environment`, and the tools that read the other layers (`read_skill_reference`,
+`search_skills`, `read_tool_source`). The code tools, `run_code` (the sandbox a skill's code runs
+in), `run_shell` and `run_in_environment`, are offered only where the deployment allows
+model-written code (see [Model-written code](#model-written-code)).
 
 Every tool's name, description and argument schema is in the model's tool list on every step. That
 cost grows with the number of tools, which is why adaptable analysis code is kept in skills.
@@ -153,9 +154,10 @@ A skill's text enters the model's context only when a step uses it:
    the bundled files.
 3. **The code.** `read_skill_reference(name, file="reference.py")` returns one bundled file.
 
-The Scientist adapts the template and runs it with `run_code`, or runs its shell commands with
-`run_shell`. `search_skills(query)` ranks the library by keyword overlap with the name, the
-description and the body.
+Where model-written code is allowed, the Scientist adapts the template and runs it with `run_code`,
+or runs its shell commands with `run_shell`; otherwise a skill with no tool of its own is guidance
+only. `search_skills(query)` ranks the library by keyword overlap with the name, the description
+and the body.
 
 ### What a skill's code gets at run time
 
@@ -188,7 +190,8 @@ the reason logged, and the skill still loads as guidance.
 
 - **The PI sees the library when it plans.** Every draft carries the skill list after the tool
   list, with each description kept up to 1,024 characters. A step that needs a skill is planned as
-  a `run_code` step that names the skill in backticks. The prompt tells the PI to prefer a tool
+  a `run_code` step that names the skill in backticks (with model-written code off, as a step that
+  names the skill and no tool, which is then not available). The prompt tells the PI to prefer a tool
   whenever one covers the step, and to describe a skill's method only as its description states it.
   So a skill's description must name its method.
 - **The plan says which skill each code step uses.** Once a plan is drafted, each new step that
@@ -303,8 +306,8 @@ step each call is counted as it ends. A call the user stops is not counted.
 
 ### Skills learned from runs
 
-With `AISCIENTIST_SKILL_INDUCTION=1` and `AISCIENTIST_INDUCED_SKILLS_DIR` set, a run ends with an
-induction step (`agents/skill_induction.py`):
+With `AISCIENTIST_SKILL_INDUCTION=1`, `AISCIENTIST_INDUCED_SKILLS_DIR` set and model-written code
+allowed, a run ends with an induction step (`agents/skill_induction.py`):
 
 1. The candidates are the successful `run_code` calls of the steps the Critic accepted.
 2. A model decides for each whether it is a reusable procedure, and if so generalizes it: the
@@ -327,9 +330,53 @@ in `_review.json` in that directory and take effect at the next step of every ru
 still reserves its name, so the same procedure is not learned twice. An induced skill records
 the run it came from (`origin_run`), which is also the id of that run's skill request.
 
+## Model-written code
+
+`AISCIENTIST_MODEL_WRITTEN_CODE` is a deployment switch, off by default. Off, every task rests on a
+tested tool or skill, or it is not offered, for every account, admins included
+(`agents/code_policy.py`):
+
+- **Tools.** `run_code`, `run_shell`, `run_in_environment`, and `request_environment` and
+  `install_package`, which only serve them, are not offered to the model, and a call to one is
+  refused at dispatch. Reading goes through the lookups (`inspect_dataset`, `list_dir`, `read_text`,
+  `find_files`, `stat_path`, `disk_usage`, `search_skills`, `read_skill_reference`). `read_text`
+  reads a file a page at a time: whole lines that fit what the model is shown, with `next_offset`
+  to read on, so a result table an MCP tool wrote (the Atlas `summary_*.tsv`) is read in full. A
+  refused call counts as a failed one: once the step has a result, two of them end it on that
+  result. The image runner that runs every MCP server's call is the platform's, not a model tool,
+  and is not affected.
+- **Plans.** A step needs model-written code when its tool is a code tool or it names no tool (a
+  literature step and the report step run their own; a step that names an HPC3 lookup such as
+  `read_text` is that lookup's step). Such a step is not accepted, whatever the
+  plan came from (`agents/research_lab/code_gate.py`): the first draft, the plan review, a revision
+  in chat or a hand edit, a saved plan shown again, the autonomous path and a campaign's next cycle
+  take it out, together with any step that needs its output; exploration and the alternatives
+  after a failed step do not propose one; an approved saved plan or a resumed run that would run
+  one is refused and planned again. The rest of the plan runs. When the plan held a step and
+  nothing but the report step is left, nothing runs and no job is submitted; a plan that holds no
+  step (the report step alone, say) runs as it would with the switch on. The card, the reply and
+  the skill request list the steps the current plan holds: a whole redraft in chat replaces them.
+- **What the user is told.** The plan card, before approval, and the reply list each such step:
+
+  > **Not available:** no tested tool or skill does "<step>". The closest skill is `<skill>`: <what
+  > it does>. It does not <what is missing>.
+
+  > **Not available:** no tested tool or skill does "<step>", so we cannot do this yet. The request
+  > has been recorded for the team.
+
+  The closest skill and what it lacks come from one `classify` call, or from a skill the step's own
+  text names. A template skill (its values marked `ADAPT`) is named this way and does not run:
+  filling it in is model-written code. A step that needs a held step's output says which.
+- **Skill requests.** The run is recorded as a skill request as soon as its plan holds such a step,
+  with each step and the closest skill named for it.
+- Skill induction is off.
+
+Turned on (`=1`), model-written code runs as described in the rest of this page, and its results
+are labelled untested.
+
 ## Untested code and skill requests
 
-Only a tool is tested code. A step whose result came from `run_code`, `run_shell` or
+This section applies where model-written code is allowed. Only a tool is tested code. A step whose result came from `run_code`, `run_shell` or
 `run_in_environment` ran code the AI wrote during the run, even when it adapted the code of a
 vetted skill that the plan assigned to the step, or followed a pipeline. `agents/code_provenance.py`
 labels every step from the calls it made, by the rule the QC-only chat reply uses to tell a check

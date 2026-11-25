@@ -92,9 +92,14 @@ def build_scientist_catalog(code_executor: Any = None,
     its executor, not through this catalog.
 
     Cross-server scientific composition belongs to the standalone MCP packages."""
+    from .code_policy import withheld_tools
     from .research_harness import default_catalog
     from .research_lab import make_run_code_tool, make_run_in_environment_tool
 
+    # Model-written code is a deployment switch, off by default (agents/code_policy.py): the code
+    # tools and the tools that only serve them are left out. The image runner is still built and
+    # handed to the MCP bridge below, which runs every MCP server's call through it.
+    withheld = withheld_tools()
     executors = {}
     catalog: list[HarnessTool] = list(default_catalog())                  # finish; scientific operations come from registered MCP servers
     catalog += tool_catalog.build_tools(where=lambda m: m.research,
@@ -104,12 +109,13 @@ def build_scientist_catalog(code_executor: Any = None,
     # Lab environments the agent built with request_environment (hpc/environments.py), bound by id.
     lab_envs = (hpc_shell.resolve_environments
                 if hpc_shell is not None and getattr(hpc_shell, "environments", None) is not None else None)
-    catalog.append(make_run_code_tool(code_executor, software_note=note,   # CodeAct (needs the sandbox)
-                                      environments=lab_envs))
+    if "run_code" not in withheld:
+        catalog.append(make_run_code_tool(code_executor, software_note=note,   # CodeAct (needs the sandbox)
+                                          environments=lab_envs))
     # A skill's declared environment (SKILL.md ``image:``) — only when the executor can run images
     # on HPC3, so a local run's roster stays honest.
     env_tool = make_run_in_environment_tool(code_executor, environments=lab_envs)
-    if env_tool is not None:
+    if env_tool is not None and env_tool.name not in withheld:
         catalog.append(env_tool)
     # The HPC3 filesystem/shell line — appended LAST so it never displaces a typed tool in the
     # model's reading of the roster. These exist because the Scientist previously had NO way to
@@ -117,7 +123,7 @@ def build_scientist_catalog(code_executor: Any = None,
     # `ls` cost minutes of queue and the model tended to guess at paths instead. Empty (not
     # broken tools) when no HPC session is bound, so a local run's roster stays honest.
     from ..hpc.shell import hpc_shell_catalog
-    catalog.extend(hpc_shell_catalog(hpc_shell))
+    catalog.extend(t for t in hpc_shell_catalog(hpc_shell) if t.name not in withheld)
     # "What does this deployment HAVE, and where is it?" Nothing answered that, and the cost was
     # real: a step that had to verify scGPT's model directory could not read it, and a step that
     # needed gene sets went to the network while three .gmt libraries sat in the directory the
@@ -128,7 +134,8 @@ def build_scientist_catalog(code_executor: Any = None,
     # and is logged; it never stops a run or the System page.
     from .mcp_bridge import build_mcp_tools
     try:
-        catalog.extend(build_mcp_tools(code_executor, env_tool, existing_names={t.name for t in catalog}))
+        catalog.extend(build_mcp_tools(code_executor, env_tool,
+                                       existing_names={t.name for t in catalog} | withheld))
     except Exception:
         import logging
         logging.getLogger(__name__).exception("MCP tools left out of the catalog")

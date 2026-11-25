@@ -352,7 +352,8 @@ def test_qc_reply_for_a_step_kept_without_review_says_so(tmp_path, as_dict):
 
 def test_qc_reply_for_an_accepted_round_covering_every_library_is_unchanged(tmp_path):
     """The reply the code gave before issue 75, character for character: an accepted step says
-    nothing about how it ended, and no library was left out."""
+    nothing about how it ended, and no library was left out. (Its table has had an ambient RNA
+    column since issue 154 item 1; these libraries carry no ambient estimate.)"""
     from aiscientist.agents.research_lab import CriticVerdict, LabResult, LabRound
     from aiscientist.gateway.app import (_brief_qc_lines, _qc_chat_reply, _qc_closing_line,
                                          _qc_step_outcome)
@@ -376,10 +377,10 @@ def test_qc_reply_for_an_accepted_round_covering_every_library_is_unchanged(tmp_
         "**Quality control done** — `run_cellqc` on Sample1_WT, Sample2_Ddx41, Sample3_GSM5676874."
         "\n\n- **41,526 of 48,112 cells kept (86.3%)**.\n\n"
         "| Library | Cell Ranger cells | after filters | after doublets | doublets removed | kept | "
-        "median % mito (before filtering) |\n|---|---:|---:|---:|---:|---:|---:|\n"
-        "| Sample1_WT | 18,681 | 18,011 | 16,750 | — | 89.7% | — |\n"
-        "| Sample2_Ddx41 | 15,872 | 15,482 | 14,553 | — | 91.7% | — |\n"
-        "| Sample3_GSM5676874 | 13,559 | 11,000 | 10,223 | — | 75.4% | — |\n\n"
+        "median % mito (before filtering) | ambient RNA |\n|---|---:|---:|---:|---:|---:|---:|---:|\n"
+        "| Sample1_WT | 18,681 | 18,011 | 16,750 | — | 89.7% | — | — |\n"
+        "| Sample2_Ddx41 | 15,872 | 15,482 | 14,553 | — | 91.7% | — | — |\n"
+        "| Sample3_GSM5676874 | 13,559 | 11,000 | 10,223 | — | 75.4% | — | — |\n\n"
         "- Thresholds: `min_counts` = 500, `min_features` = 300, `max_pct_mt` = 10.\n"
         "- ⚠️ Sample1_WT: Doublet filtering needs review; see the technical details in the Downloads panel.\n")
     assert _qc_closing_line(result(3)) == (
@@ -497,7 +498,8 @@ def test_plan_mode_revise_replans_then_approves():
     plans = [["Run QC on the dataset", "Identify marker genes"], ["Only run QC and report"]]
 
     def complete(messages):
-        sys = messages[0]["content"]
+        from plan_turns import instruction
+        sys = instruction(messages)
         if "Principal Investigator of a bioinformatics lab" in sys:
             i = min(pi_calls["n"], len(plans) - 1)
             pi_calls["n"] += 1

@@ -1,0 +1,60 @@
+# A PostgreSQL for trying AiScientist on Kubernetes: one pod with its own volume, reached in the
+# namespace as aiscientist-postgres:5432. For a deployment people rely on, use a managed PostgreSQL
+# with backups. The password comes from the Secret aiscientist-postgres (key POSTGRES_PASSWORD),
+# made as deploy/k8s/README.md shows.
+#
+#   kubectl -n aiscientist apply -f deploy/k8s/postgres.yaml
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: aiscientist-postgres
+  labels: { app.kubernetes.io/name: aiscientist-postgres }
+spec:
+  selector: { app.kubernetes.io/name: aiscientist-postgres }
+  ports:
+    - { name: postgres, port: 5432, targetPort: postgres }
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: aiscientist-postgres
+  labels: { app.kubernetes.io/name: aiscientist-postgres }
+spec:
+  serviceName: aiscientist-postgres
+  replicas: 1
+  selector:
+    matchLabels: { app.kubernetes.io/name: aiscientist-postgres }
+  template:
+    metadata:
+      labels: { app.kubernetes.io/name: aiscientist-postgres }
+    spec:
+      securityContext:
+        fsGroup: 999                       # the image's postgres account
+      containers:
+        - name: postgres
+          image: postgres:16
+          ports:
+            - { name: postgres, containerPort: 5432 }
+          env:
+            - { name: POSTGRES_USER, value: aiscientist }
+            - { name: POSTGRES_DB, value: aiscientist }
+            - name: POSTGRES_PASSWORD
+              valueFrom: { secretKeyRef: { name: aiscientist-postgres, key: POSTGRES_PASSWORD } }
+            - { name: PGDATA, value: /var/lib/postgresql/data/pgdata }   # the volume's root may hold lost+found
+          readinessProbe:
+            exec: { command: ["pg_isready", "-U", "aiscientist", "-d", "aiscientist"] }
+            periodSeconds: 5
+          volumeMounts:
+            - { name: pgdata, mountPath: /var/lib/postgresql/data }
+          resources:
+            requests: { cpu: 250m, memory: 256Mi }
+            limits: { memory: 1Gi }
+  volumeClaimTemplates:
+    - metadata:
+        name: pgdata
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 10Gi

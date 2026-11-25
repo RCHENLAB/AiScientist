@@ -600,3 +600,70 @@ def test_removing_assigned_skills_clears_legacy_and_plural_yaml_without_touching
     restored = parse_plan_yaml(result["yaml"])
     assert restored.steps[0].skill is None and restored.steps[0].planned_skills() == []
     assert restored.steps[1].planned_skills() == [assigned[1]]
+
+
+# --- the data a step reads (RCHENLAB/AiScientist#120) ------------------------------------------------------
+
+DATASET_HARNESS = r"""
+const vm = require("vm");
+const src = require("fs").readFileSync(0, "utf8");
+const escapeHtml = __ESCAPE__;
+const sandbox = { state: { planDoc: null, planProblems: [], planDraftYaml: "" }, escapeHtml,
+  renderMarkdown: (s) => escapeHtml(s) };
+const api = vm.runInNewContext(src + "\n;({ planStepHtml, planEntryHtml, planDatasetText })", sandbox);
+const step = { id: "s2", tool: "submit_query", dataset: { name: "HECA", version: "v2026.11.2",
+  file: "HRCA_snRNA_allcells.h5ad", source: "shared", id: "heca" } };
+const own = { id: "s1", tool: "run_scanpy_qc", dataset: { name: "ko <wt>.h5ad", source: "own", id: "u1" } };
+console.log(JSON.stringify({
+  waiting: api.planStepHtml("**Expression** — Query RHO.", 2, step, false, true, { remove: true }),
+  saved: api.planStepHtml("**Expression** — Query RHO.", 2, step, false, true, null),
+  own: api.planStepHtml("**QC** — Filter.", 1, own, false, true, { remove: true }),
+  none: api.planStepHtml("**QC** — Filter.", 1, { id: "s1", tool: "run_scanpy_qc" }, false, true, { remove: true }),
+  entry: api.planEntryHtml(["**QC** — Filter.", "**Expression** — Query RHO."], { steps: [own, step] }, { pending: true }),
+  text: api.planDatasetText(step.dataset),
+}));
+""".replace("__ESCAPE__", ESCAPE)
+
+
+def test_a_step_shows_the_dataset_it_reads_and_each_part_is_editable_while_the_plan_waits():
+    out = _node(DATASET_HARNESS, "function planStepParts", "function showPlanPanel")
+    assert out["text"] == "HECA v2026.11.2 · HRCA_snRNA_allcells.h5ad"
+    waiting = out["waiting"]
+    assert 'class="plan-step-skill plan-step-dataset"' in waiting and "shared dataset" in waiting
+    for key, value in (("name", "HECA"), ("version", "v2026.11.2"), ("file", "HRCA_snRNA_allcells.h5ad")):
+        assert f'data-edit="dataset" data-key="{key}" tabindex="0" role="button" title="Change the dataset\'s {key}">{value}</span>' in waiting
+    assert "data-edit" not in out["saved"].split("plan-step-dataset")[1].split("</span></span>")[0], \
+        "an approved plan's dataset is read-only"
+    assert "ko &lt;wt&gt;.h5ad" in out["own"] and "ko <wt>" not in out["own"] and "your data" in out["own"]
+    assert 'data-key="version"' not in out["own"], "your own data has no versions"
+    assert "plan-step-dataset" not in out["none"]
+    assert out["entry"].count("plan-step-dataset") == 2 and 'data-edit="dataset"' not in out["entry"]
+    assert 'title="Reads HECA v2026.11.2 · HRCA_snRNA_allcells.h5ad"' in out["entry"], \
+        "the chat's entry names the dataset and version, the whole on hover"
+
+
+def test_a_dataset_part_is_changed_in_the_document_and_nothing_else():
+    from aiscientist.agents.plan_doc import PlanDoc, PlanStep, parse_plan_yaml
+
+    doc = PlanDoc("q", (PlanStep("s1", "**QC** — Filter with `run_scanpy_qc`.", tool="run_scanpy_qc",
+                                 settings={"min_genes": 200}),
+                        PlanStep("s2", "**Expression** — Query RHO with `submit_query`.", tool="submit_query",
+                                 dataset={"name": "HECA", "version": "v2026.11.2", "file": "HRCA_snRNA_allcells.h5ad",
+                                          "source": "shared", "id": "heca"})))
+    text = doc.to_yaml()
+    version, file, whole, renamed, none, empty = _edits(text, [
+        {"id": "s2", "dataset": "version", "value": "v2026.11.1"},
+        {"id": "s2", "dataset": "file", "value": "Lens_scRNA_allcells.h5ad"},
+        {"id": "s2", "dataset": "file", "value": "whole version"},
+        {"id": "s2", "dataset": "name", "value": "ko_vs_wt.h5ad"},
+        {"id": "s1", "dataset": "name", "value": "HECA"},
+        {"id": "s2", "dataset": "name", "value": ""},
+    ])
+    back = parse_plan_yaml(version["yaml"], request="q")
+    assert back.steps[1].dataset["version"] == "v2026.11.1" and back.steps[0] == parse_plan_yaml(text).steps[0]
+    assert parse_plan_yaml(file["yaml"]).steps[1].dataset["file"] == "Lens_scRNA_allcells.h5ad"
+    assert "file" not in parse_plan_yaml(whole["yaml"]).steps[1].dataset, "the whole version: no file"
+    assert parse_plan_yaml(renamed["yaml"]).steps[1].dataset == {
+        "name": "ko_vs_wt.h5ad", "version": "v2026.11.2", "file": "HRCA_snRNA_allcells.h5ad"}, \
+        "another name drops what the server filled in for the old one; it checks the rest"
+    assert "names no dataset" in none["error"] and "needs its name" in empty["error"]

@@ -372,6 +372,7 @@ def test_exporter_paginates_and_refuses_duplicate_names_or_cursor_loops():
 
 
 @pytest.mark.parametrize("broken", ["invalid", "unreadable", "no_jsonschema"])
+@pytest.mark.usefixtures("model_written_code")
 def test_an_unusable_registry_leaves_out_only_the_mcp_tools(registry, tmp_path, monkeypatch, caplog, broken):
     import sys
     from aiscientist.agents import atlas_expression as atlas

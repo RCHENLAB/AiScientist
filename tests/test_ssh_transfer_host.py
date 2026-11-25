@@ -32,6 +32,9 @@ class _FakeRemoteFile:
     def prefetch(self, size: int | None = None) -> None:
         self.owner.prefetched.append(size)
 
+    def seek(self, offset: int) -> None:
+        self.pos = offset
+
     def read(self, size: int | None = None) -> bytes:
         chunk = self.data[self.pos:] if size is None else self.data[self.pos:self.pos + size]
         self.pos += len(chunk)
@@ -228,6 +231,19 @@ def test_a_bounded_peek_never_prefetches_the_whole_file(dtn):
 
     assert ex.read_bytes("/dfs3b/u/huge.vcf", 512) == b"x" * 512
     assert dtn.clients[0].prefetched == [512]
+
+
+def test_a_read_from_an_offset_prefetches_only_its_window(dtn):
+    """read_text pages through a result table from ``next_offset``: over SFTP, never a ``tail`` on
+    the login node, and only the page's bytes are fetched (paramiko's prefetch takes the window's
+    end)."""
+    ex = _executor()
+    data = bytes(range(256)) * 16
+    ex._transfer_session().files["/dfs3b/run/summary.tsv"] = data
+
+    assert ex.read_bytes("/dfs3b/run/summary.tsv", 512, offset=1000) == data[1000:1512]
+    assert dtn.clients[0].prefetched == [1512]
+    assert ex.execs == []
 
 
 def test_unbounded_read_prefetches_whole_file(dtn):

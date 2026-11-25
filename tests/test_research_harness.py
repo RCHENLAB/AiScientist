@@ -8,6 +8,8 @@ that don't emit native tool_calls, the stop reasons, and the privacy guard.
 
 from __future__ import annotations
 
+import pytest
+
 from native_tool_fixtures import fixture_catalog
 
 import json
@@ -203,6 +205,7 @@ def test_repeated_tool_errors_bail_the_step_early() -> None:
     assert len(result.errors) == 3          # bailed on the 3rd consecutive error
 
 
+@pytest.mark.usefixtures("model_written_code")
 def test_tool_returning_cancelled_stops_the_step() -> None:
     # A cancellable tool (run_code / Slurm) that scancelled itself on Stop returns
     # {status: cancelled}; the harness must end the step at once, not treat it as a result.
@@ -291,6 +294,7 @@ def _probe_then_two_errors(first: str) -> ResearchHarness:
         _tool_call("mcp_run_enrichment", {}), _tool_call("finish", {"answer": "enriched"})]))
 
 
+@pytest.mark.usefixtures("model_written_code")
 def test_a_lookup_is_not_a_result_so_errors_after_it_do_not_stop_the_step() -> None:
     result = _probe_then_two_errors("read_tool_source").run("ORA", _ctx())
 
@@ -299,6 +303,7 @@ def test_a_lookup_is_not_a_result_so_errors_after_it_do_not_stop_the_step() -> N
         "read_tool_source", "run_code", "run_code", "mcp_run_enrichment", "finish"]
 
 
+@pytest.mark.usefixtures("model_written_code")
 def test_errors_after_a_real_result_still_stop_the_step_early() -> None:
     result = _probe_then_two_errors("mcp_run_clustering").run("ORA", _ctx())
 

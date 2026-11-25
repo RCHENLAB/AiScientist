@@ -13,6 +13,7 @@ here are the ones that make a near-complete shell safe to hand an agent on a SHA
 
 from __future__ import annotations
 
+import json
 import re
 import shlex
 import subprocess
@@ -48,8 +49,9 @@ class FakeRemote:
         out, err, code = self.default
         return ExecResult(command, code, out, err)
 
-    def read_bytes(self, path: str, max_bytes: int | None = None) -> bytes:
-        return self.files.get(path, b"")[: max_bytes or None]
+    def read_bytes(self, path: str, max_bytes: int | None = None, offset: int = 0) -> bytes:
+        data = self.files.get(path, b"")[offset:]
+        return data[: max_bytes or None]
 
     def remote_size(self, path: str) -> int:
         return len(self.files.get(path, b""))
@@ -298,9 +300,11 @@ def test_read_text_is_byte_capped_and_says_so():
 
 
 class LocalReadRemote:
-    """Real metadata commands/files, with the production missing-file transfer contract."""
+    """Real metadata commands/files, with the production missing-file transfer contract. Every
+    login-node command is kept in ``cmds``."""
 
     def exec(self, command, timeout=60):
+        self.__dict__.setdefault("cmds", []).append(command)
         if command.startswith("readlink -f "):
             path = shlex.split(command)[2]
             return ExecResult(command, 0, str(Path(path).resolve()), "")
@@ -310,10 +314,11 @@ class LocalReadRemote:
     def remote_size(self, path):
         return Path(path).stat().st_size if Path(path).is_file() else 0
 
-    def read_bytes(self, path, max_bytes=None):
+    def read_bytes(self, path, max_bytes=None, offset=0):
         if not Path(path).is_file():
             return b""
         with Path(path).open("rb") as stream:
+            stream.seek(offset)
             return stream.read(max_bytes)
 
 
@@ -335,8 +340,62 @@ def test_mcp_full_result_path_reads_bound_artifacts_without_home_fallback(tmp_pa
     tool = next(t for t in hs.hpc_shell_catalog(shell) if t.name == "read_text")
     result = tool.executor({"path": relative}, None)
     assert result["path"] == str(Path(shell.artifacts_dir) / relative)
-    assert result["size_bytes"] == 70_000 and result["bytes_returned"] == hs.MAX_READ_BYTES
-    assert result["text"] == "x" * hs.MAX_READ_BYTES and result["truncated"]
+    assert result["size_bytes"] == 70_000 and result["truncated"]
+    # One page is what the model is shown whole; next_offset reads on, and the pages make the file.
+    text, pages = result["text"], 1
+    while "next_offset" in result:
+        assert len(json.dumps(result)) <= ResearchHarnessFeed, "a page is fed to the model uncut"
+        result = tool.executor({"path": relative, "offset": result["next_offset"]}, None)
+        text, pages = text + result["text"], pages + 1
+    assert text == "x" * 70_000 and pages == 4 and not result["truncated"]
+
+
+ResearchHarnessFeed = __import__("aiscientist.agents.research_harness",
+                                 fromlist=["_FEED_RESULT_CHARS"])._FEED_RESULT_CHARS
+
+
+def test_a_table_is_read_page_by_page_in_whole_lines(tmp_path):
+    """A result table longer than one page: each page ends at a line end, says where the rest
+    starts, and fits what the harness feeds the model; tail reads whole lines from the end."""
+    shell = _local_bound_shell(tmp_path)
+    rows = [f"GENE{i % 4}\tType_{i:04d}\t{i}\t{i / 7:.4f}" for i in range(3000)]
+    table = "gene\tcelltype\tn_cells\tcp10k\n" + "\n".join(rows) + "\n"
+    (Path(shell.artifacts_dir) / "summary.tsv").write_text(table)
+    tool = next(t for t in hs.hpc_shell_catalog(shell) if t.name == "read_text")
+    first = tool.executor({"path": "summary.tsv"}, None)
+    assert first["truncated"] and first["text"].endswith("\n") and first["offset"] == 0
+    assert "offset=" in first["note"] and len(json.dumps(first)) <= ResearchHarnessFeed
+    pages, result = [first["text"]], first
+    while "next_offset" in result:
+        result = tool.executor({"path": "summary.tsv", "offset": result["next_offset"]}, None)
+        assert result["text"].endswith("\n") and len(json.dumps(result)) <= ResearchHarnessFeed
+        pages.append(result["text"])
+    assert "".join(pages) == table and len(pages) > 2
+    end = tool.executor({"path": "summary.tsv", "tail": True}, None)
+    assert table.endswith(end["text"]) and end["text"].startswith("GENE") and end["truncated"]
+    assert end["offset"] + end["bytes_returned"] == len(table)
+    past = tool.executor({"path": "summary.tsv", "offset": len(table)}, None)
+    assert past["text"] == "" and not past["truncated"]
+    # Every page came over the transfer channel: the login node only answered metadata (test -f,
+    # readlink), never moved a byte of the table.
+    assert not [c for c in shell.remote.cmds if re.search(r"\b(tail|head|cat|dd)\b", c)]
+
+
+def test_pages_count_the_bytes_of_the_file_whatever_they_decode_to(tmp_path):
+    """A byte that is not UTF-8 (a Latin-1 gene note) must not move the next page: ``next_offset``
+    counts the file's bytes, not the decoded text's."""
+    shell = _local_bound_shell(tmp_path)
+    rows = [f"GENE{i}\tnote \xe9t\xe9 {i}".encode("latin-1") for i in range(4000)]
+    data = b"gene\tnote\n" + b"\n".join(rows) + b"\n"
+    (Path(shell.artifacts_dir) / "notes.tsv").write_bytes(data)
+    first = shell.read_text("notes.tsv")
+    got, result = bytearray(data[:first["next_offset"]]), first
+    assert result["offset"] == 0 and data[:result["bytes_returned"]].endswith(b"\n")
+    while "next_offset" in result:
+        result = shell.read_text("notes.tsv", offset=result["next_offset"])
+        assert data[result["offset"]:result["offset"] + result["bytes_returned"]].startswith(b"GENE")
+        got += data[result["offset"]:result["offset"] + result["bytes_returned"]]
+    assert bytes(got) == data, "the pages, as bytes of the file, make the file"
 
 
 @pytest.mark.parametrize("given,root,relative", [
@@ -389,10 +448,15 @@ def test_failed_transfer_cannot_report_successful_empty_read(tmp_path, monkeypat
 
 
 def test_failed_tail_is_an_error():
-    remote = FakeRemote([(r"^tail ", "", "Permission denied", 1)])
+    remote = FakeRemote()
     remote.files[f"{HOME}/log"] = b"x" * 100
+
+    def refused(path, max_bytes=None, offset=0):
+        raise OSError("Permission denied")
+    remote.read_bytes = refused
     with pytest.raises(HpcShellError, match="Could not read"):
         _shell(remote).read_text("~/log", max_bytes=10, tail=True)
+    assert not [c for c in remote.cmds if c.startswith("tail ")], "a tail is read over SFTP too"
 
 
 def test_find_files_is_bounded_in_depth_and_count():

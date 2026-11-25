@@ -142,7 +142,7 @@ class MockExecutor:
         # No real remote FS in mock mode; nothing to fetch.
         return None
 
-    def read_bytes(self, remote_path: str, max_bytes: "int | None" = None) -> bytes:
+    def read_bytes(self, remote_path: str, max_bytes: "int | None" = None, offset: int = 0) -> bytes:
         # No real remote FS in mock mode; "missing file" is the honest answer, and it is the
         # same answer the real executor gives for one — callers already handle it.
         return b""

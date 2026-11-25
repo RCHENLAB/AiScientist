@@ -69,7 +69,11 @@ def _parse_agenda(raw: str, max_steps: int) -> list[str] | None:
             except json.JSONDecodeError:
                 parsed = None
     if isinstance(parsed, dict):
-        parsed = parsed.get("steps") or parsed.get("agenda")
+        # ``agenda`` first: ``plan_steps`` beside it holds the structured steps (#122), and an older
+        # reply that named its list ``steps`` is still read when it holds the step texts.
+        legacy = parsed.get("steps")
+        parsed = parsed.get("agenda") or (legacy if isinstance(legacy, list)
+                                          and all(isinstance(x, str) for x in legacy) else None)
     if isinstance(parsed, list) and parsed:
         steps = [s for s in (_strip_step_ordinal(str(x)) for x in parsed) if s]
         steps = [s for s in steps if not _is_placeholder_step(s)] or steps

@@ -13,6 +13,7 @@ import json
 
 from aiscientist.agents.research_harness import HarnessContext, ResearchHarness
 from aiscientist.agents.research_lab import LabConfig, ResearchLab
+from plan_turns import instruction
 
 
 def _ctx(decisions=None) -> HarnessContext:
@@ -56,7 +57,7 @@ def _router(agenda, *, gate=None, pi=None, poststep=None, critic=None,
     plan_pi = plan_pi or (lambda _u: {"final_agenda": list(agenda)})
 
     def complete(messages):
-        sys = messages[0]["content"]
+        sys = instruction(messages)
         user = messages[-1]["content"] if len(messages) > 1 else ""
         if seen is not None:
             seen.append(sys)

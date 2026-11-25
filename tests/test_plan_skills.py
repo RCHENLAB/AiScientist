@@ -511,3 +511,21 @@ def test_the_card_shows_the_skill_and_takes_it_off_as_one_line_of_the_document()
     assert edited.steps[0].skill is None
     assert apply_edit(doc, edited)[1] == [
         {"kind": "skill", "step": 1, "id": "s1", "before": SIGNATURE, "after": ""}]
+
+
+# --- the skill named in the draft's structured steps (RCHENLAB/AiScientist#122) ---------------------------
+
+def _structured(step: str, skill) -> str:
+    return json.dumps({"breadth": "specific", "agenda": [step], "later": [],
+                       "plan_steps": [{"tool": None, "settings": {}, "skill": skill}]})
+
+
+@pytest.mark.parametrize("skill, matched", [("score_signature", False), (None, False), ("no-such-skill", True)])
+def test_the_drafts_skill_is_checked_against_the_library_and_the_matcher_is_the_fallback(
+        tmp_path, library, skill, matched):
+    lab, record, _workspace = _lab(tmp_path, plan_replies=[_structured(SCORE_STEP, skill)],
+                                   match_reply=json.dumps([{"step": 1, "skill": "score_signature"}]))
+    _result, events, _seen = _run(lab)
+    assert bool(record.get("match_calls")) is matched, "the skill call is made only for a step the draft did not settle"
+    expected = None if skill is None else SIGNATURE   # an unknown name: the matcher's answer
+    assert _of(events, "plan_doc")[0]["steps"][0].get("skill") == expected

@@ -157,6 +157,17 @@ _PI_SYSTEM = (
     'above and attach real, DOI-backed citations that support the biological interpretation."'
     '], "self_sourced": "<every choice in this plan that came from your own judgement, or none — '
     'every choice in this plan comes from the guidance and the dataset profile.>", "later": []}. '
+    "ALSO RETURN `plan_steps` IN THE SAME OBJECT, one object per agenda item in the same order, for the "
+    "plan document the researcher approves: "
+    '{"tool": "<the one tool the step runs, as the step names it in backticks>", "settings": '
+    '{"<setting>": <value>}, "skill": "<skill name>" | null}. `settings` are that tool\'s '
+    "arguments whose value the step's sentence STATES — a number written in it, a column, group or "
+    "method it names — under the setting names listed for the tool; never a default the sentence "
+    "does not state and never a file path; {} when the sentence states none. A `run_code` step has "
+    "no settings. `skill` is the one skill a `run_code` step applies, from the skills listed, or "
+    "null; a step a listed tool performs has null. For the example above: "
+    '[{"tool": "run_scanpy_qc", "settings": {"min_genes": 200, "max_pct_mt": 10, "min_cells": 3}, '
+    '"skill": null}, {"tool": "run_clustering", "settings": {}, "skill": null}, ...]. '
     "DECLARE WHAT THE PROTOCOL DID NOT COVER. A research protocol cannot anticipate every dataset, "
     "so going beyond it is expected and often correct — but it must be VISIBLE, because a reader "
     "otherwise cannot tell a protocol-mandated choice from one you made. Write in `self_sourced` "
@@ -191,16 +202,29 @@ _PLAN_SKILLS_HEADER = (
     "do not name a different one.")
 
 
+# The same section while the deployment runs no model-written code (agents/code_policy.py): a skill
+# with no tool of its own cannot run, and it is named as the closest skill of a step that is not
+# available (research_lab/code_gate.py).
+_PLAN_SKILLS_HEADER_NO_CODE = (
+    "Skills in the library. This deployment runs no code the AI writes, so a skill runs only "
+    "through tools of its own in the list above; one with no such tool is a template that cannot "
+    "run here. When the request asks for what such a skill does, write that step naming the skill "
+    "in backticks and no tool: it is reported to the user as not available. Describe a skill's "
+    "method only as its line below states it.")
+
+
 def plan_skills_block(query: str, skills: "dict[str, Skill] | None" = None,
                       limit: "int | None" = None) -> str:
     """The planning prompt's skill section for ``query`` (the question plus the dataset profile);
     '' when the library is empty. See :func:`~aiscientist.agents.skills.plan_skill_lines`."""
+    from ..code_policy import model_written_code
     lines, left_out = plan_skill_lines(query, skills, limit)
     if not lines:
         return ""
     tail = (f"\n({left_out} more skills exist; the scientist can find them with `search_skills`.)"
             if left_out else "")
-    return _PLAN_SKILLS_HEADER + "\n" + "\n".join(lines) + tail
+    header = _PLAN_SKILLS_HEADER if model_written_code() else _PLAN_SKILLS_HEADER_NO_CODE
+    return header + "\n" + "\n".join(lines) + tail
 
 
 _CRITIC_SYSTEM = (
@@ -268,6 +292,9 @@ _SYNTH_SYSTEM = (
     "Never state a PASS/non-PASS split, an allele-frequency cutoff, or a total the results do not show — "
     "do NOT write 'all PASS' or '0 non-PASS' unless the results report zero non-PASS. "
     "State limitations honestly and frame conclusions as hypotheses to validate. "
+    # The plan's steps and their state are on the plan cards (RCHENLAB/AiScientist#121).
+    "Do not draw the plan or the order of the steps as a flow chart (no ```mermaid block, no arrows "
+    "between step names) unless the request asks for one; a figure that explains a result is fine. "
     + QC_SUMMARY_POLICY
 )
 
@@ -340,7 +367,33 @@ _PLAN_QA_SYSTEM = (
     "why it suits (or does not suit) THIS dataset, including the unit the statistics run over. If "
     "the honest answer is that the plan has a weakness, say so and name the change that would fix "
     "it — but do not make the change; the researcher decides. If the question cannot be answered "
-    "from what you have, say what is missing. A few clear sentences; no headings, no preamble."
+    "from what you have, say what is missing. When earlier questions and answers of this review are "
+    "given, answer in their light: do not repeat what you already said, and keep to what you said "
+    "unless you now correct it, saying so. When the datasets the researcher can use are listed and "
+    "the question is about data, answer from that list by name, version and file; never invent a "
+    "dataset. A few clear sentences; no headings, no preamble."
+)
+
+
+# Reading a reply to the plan waiting for approval (RCHENLAB/AiScientist#120). The word lists of
+# ``classify_plan_reply`` sent a reply one way only, so a question and a change in one reply lost one
+# of them, and a request to look something up first was taken for a change with nothing to change.
+_PLAN_REPLY_SYSTEM = (
+    "You read a researcher's reply to an analysis plan that is waiting for their approval, and say "
+    "what the reply asks for. Split it into parts, each of one kind:\n"
+    "- question: they ask about the plan, a step, a method, a setting or the data and want an "
+    "answer. A question changes nothing.\n"
+    "- change: they ask for the plan to be different: a step added, removed, reworded or moved; "
+    "a setting, tool, skill or dataset changed.\n"
+    "- lookup: they ask you to find something the plan does not have yet, before changing it or "
+    "instead of it: which datasets exist, which version or file to use, which columns a dataset has.\n"
+    "A reply can hold several parts, in the order written: 'Which datasets does step 2 use? Use X "
+    "instead' is a question and then a change; 'look for the datasets again and write them into "
+    "the plan' is a lookup and then a change. A polite request phrased as a question ('could you "
+    "use 0.5?') is a change. A remark that asks for nothing is a question. Give each part the "
+    "researcher's own words for it, in their language, and nothing of the other parts. "
+    'Reply with ONLY a JSON object: {"parts": [{"kind": "question" | "change" | "lookup", '
+    '"text": "<their words>"}]}.'
 )
 
 
@@ -721,7 +774,19 @@ _PLAN_REVIEW_PI_SYSTEM = (
     "written, a claim audit checks every candidate conclusion against the design (depth gap, "
     "replication) and the artifacts, so such a step duplicates it. Add a step only for a requested "
     "analysis, or a prerequisite of one, that no step computes. "
-    'Reply with ONLY a JSON object: {"final_agenda": ["<step>", ...], "reason": "<one sentence>"}.'
+    'Reply with ONLY a JSON object: {"final_agenda": ["<step>", ...], "plan_steps": [<one object per '
+    'final step, as in your plan: {"tool", "settings", "skill"}>], "reason": "<one sentence>"}.'
+)
+
+# One expert's turn in a team meeting. The same text for every expert: who each one is comes at the
+# end of its user message, after the shared context, so the experts' calls share a prompt prefix
+# (RCHENLAB/AiScientist#122).
+_MEETING_EXPERT_SYSTEM = (
+    "You are an expert team member in a research team's meeting. Your name and expertise are given "
+    "at the end of the message. Contribute concise, specific, technically-grounded input on the "
+    "meeting topic from YOUR expertise. Be honest about uncertainty and disagree when the evidence "
+    "warrants. You hold only PART of the picture — say so rather than papering over what you cannot "
+    "see."
 )
 
 _MEETING_SYNTH_SYSTEM = (
@@ -791,8 +856,8 @@ _PLAN_BIND_SYSTEM = (
 _PLAN_REFORMAT = (
     "Your reply above could not be read as the plan. The plan must be ONE JSON object and nothing "
     "else. Send it again as ONLY the JSON object your instructions describe, "
-    '{"breadth": ..., "agenda": [...], "self_sourced": "...", "later": [...]} (or the clarify '
-    'object), with no prose, no '
+    '{"breadth": ..., "agenda": [...], "plan_steps": [...], "self_sourced": "...", "later": [...]} (or '
+    'the clarify object), with no prose, no '
     "headings and no code fences. Keep the steps you meant, one string per step, and keep the whole "
     "reply short enough to finish."
 )
@@ -820,17 +885,18 @@ _PLAN_SKILLS_SYSTEM = (
 _PLAN_REVISE_SYSTEM = (
     "You are changing an analysis plan for the researcher who asked for the change. The plan is a "
     "YAML document: each step has an `id`, a `title`, the `tool` it runs, `settings` (arguments "
-    "passed to that tool exactly as written), `does` (what the step does, in prose) and, for a step "
-    "that runs code, the `skill` whose vetted code it uses. Make the "
+    "passed to that tool exactly as written), `does` (what the step does, in prose), `dataset` (the "
+    "data it reads) and, for a step that runs code, the `skill` whose vetted code it uses. Make the "
     "requested change with the FEWEST operations and leave every step the request does not concern "
     "exactly as it is: you return operations on the document, never the document. "
     'Reply with ONLY a JSON object {"ops": [...]}. An operation is one of:\n'
     '{"op": "change", "step": "<id>", "settings": {"<name>": <value>}} - set a tool argument (null '
     "removes it). A number that is listed under `settings` is changed THERE; the step's sentence is "
     "updated for you.\n"
-    '{"op": "change", "step": "<id>", "title": "...", "does": "..."} - reword a step: either field '
-    'or both, and "tool" when the step should run another tool. Keep its style and level of '
-    "detail, and name the tool in `does` in backticks.\n"
+    '{"op": "change", "step": "<id>", "title": "...", "does": "...", "settings": {...}} - reword a '
+    'step: either field or both, and "tool" when the step should run another tool. Keep its style '
+    "and level of detail, and name the tool in `does` in backticks. Give the step's `settings` as "
+    "the new sentence states them in the same operation ({} when it states none).\n"
     '{"op": "change", "step": "<id>", "skill": null} - the step goes without its skill, when the '
     "researcher asks for that; a skill's name sets it.\n"
     '{"op": "remove", "step": "<id>"}\n'
@@ -838,11 +904,22 @@ _PLAN_REVISE_SYSTEM = (
     '{...}} - a new step after that one ("after": "start" puts it first; leave "after" out to add '
     "it at the end).\n"
     '{"op": "move", "step": "<id>", "after": "<id>"} - "after": "start" moves it first.\n'
+    '{"op": "change", "step": "<id>", "dataset": {"name": "...", "version": "...", "file": "..."}} - '
+    "the data the step reads, from the datasets listed as available: the dataset's name, and for a "
+    "shared dataset its version and the file the step reads (null removes it); add its \"id\" when "
+    "two of the researcher's datasets share the name. Name only a dataset, version and file that is "
+    "on that list; a step's `does` says which data it reads in words too.\n"
     "Use only tools from the list you are given and only settings that tool takes; give a setting "
     "only when the request or the step states its value. A step that runs code (run_code) has no "
     "settings: say in `does` what the code is to do. When a change leaves a step's `does` describing "
     "something other than what will now run (the old value, the old way of choosing it), reword that "
     "`does` in the same operation. "
+    "NEVER copy the researcher's message into a step: a step says what the step will do, in the "
+    "plan's own words, not what was asked. When the request cannot be carried out with the tools, "
+    "the settings and the datasets you are given (a dataset nobody has, a tool this deployment "
+    "lacks, information you were not given), change nothing and reply "
+    '{"cannot": "<one or two sentences to the researcher: what could not be done, and what is '
+    'needed>"}. '
     'If the request asks for a different analysis altogether - a new plan, not a change to this '
     'one - reply {"ops": []} and the plan will be drafted again.'
 )

@@ -34,6 +34,7 @@ Two more fences, because a near-complete shell on a SHARED lab account is a real
 
 from __future__ import annotations
 
+import json
 import posixpath
 import re
 import shlex
@@ -47,11 +48,22 @@ from ..tools.sdk import HarnessTool
 MAX_READ_BYTES = 64_000
 MAX_ENTRIES = 500
 MAX_OUTPUT_CHARS = 20_000
+# One read_text page, in characters of JSON-encoded text. The harness feeds a tool result back to
+# the model up to 24,000 characters and cuts the rest without a word (research_harness
+# ``_FEED_RESULT_CHARS``); JSON doubles every tab and newline, so a 64 KB table came back as its
+# first ~20 KB while saying ``truncated: false``. A page that fits is seen whole.
+MAX_PAGE_CHARS = 20_000
 
 # Hosts the agent may download from WITHOUT asking. Reference data for this lab's work, all
 # publicly served and all things a bioinformatician would fetch by hand. Anything else is a HITL
 # prompt rather than a refusal — the point is that a human sees the URL, not that the list is
 # exhaustive.
+#: The tools :func:`hpc_shell_catalog` builds, by name; the read-only lookups first. A plan is
+#: checked before any HPC3 session exists, so the step classifier knows them from here: with
+#: model-written code off a step that reads a result file with ``read_text`` is a covered step.
+LOOKUP_TOOLS = ("list_dir", "stat_path", "find_files", "read_text", "disk_usage", "find_software")
+SHELL_TOOLS = LOOKUP_TOOLS + ("run_shell", "fetch_url", "install_package", "request_environment")
+
 DEFAULT_FETCH_ALLOWLIST = (
     "ftp.ensembl.org", "ensembl.org", "ftp.ncbi.nlm.nih.gov", "ncbi.nlm.nih.gov",
     "hgdownload.soe.ucsc.edu", "hgdownload.cse.ucsc.edu", "ftp.ebi.ac.uk", "ebi.ac.uk",
@@ -213,6 +225,28 @@ def _clip(text: str, limit: int = MAX_OUTPUT_CHARS) -> str:
     if len(text) <= limit:
         return text
     return text[:limit] + f"\n…(truncated, {len(text) - limit} more characters)"
+
+
+def _page(raw: bytes, budget: int, *, from_end: bool = False) -> bytes:
+    """The longest part of ``raw`` from its start (or its end) whose text, JSON-encoded, fits
+    ``budget`` characters, cut at a line end when that part holds one."""
+    def fits(part: bytes) -> bool:
+        return len(json.dumps(part.decode("utf-8", errors="replace"))) <= budget
+    if fits(raw):
+        return raw
+    lo, hi = 0, len(raw)
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        if fits(raw[-mid:] if from_end else raw[:mid]):
+            lo = mid
+        else:
+            hi = mid - 1
+    part = raw[len(raw) - lo:] if from_end else raw[:lo]
+    if from_end:
+        cut = part.find(b"\n")
+        return part[cut + 1:] if 0 <= cut < len(part) - 1 else part
+    cut = part.rfind(b"\n")
+    return part[:cut + 1] if cut > 0 else part
 
 
 def _host_of(url: str) -> str:
@@ -404,11 +438,16 @@ class HpcShell:
                          if len(rows) >= n else "")}
 
     def read_text(self, path: str, max_bytes: int = MAX_READ_BYTES,
-                  tail: bool = False) -> dict[str, Any]:
-        """Read a file's head over SFTP, or a bounded tail over the login channel.
+                  tail: bool = False, offset: int = 0) -> dict[str, Any]:
+        """Read one page of a file over SFTP: its head, from byte ``offset``, or its tail.
 
         Going through the transfer channel rather than ``cat`` means reading a file is not a
-        login-node process at all, and it reuses the executor's existing size/truncation handling.
+        login-node process at all, at any offset, and it reuses the executor's existing
+        size/truncation handling.
+
+        A page is whole lines that fit :data:`MAX_PAGE_CHARS` once JSON-encoded, so the model sees
+        all of it. When more of the file follows, ``truncated`` is true and ``next_offset`` is where
+        the next page starts: with model-written code off this is how a table is read in full.
         """
         p = self._read_path(path)
         self._realpath_guard(p, write=False)
@@ -431,24 +470,32 @@ class HpcShell:
             if getattr(empty, "exit_status", 1) != 0:
                 raise HpcShellError(f"Could not stat {p} through the transfer channel; retry the read.")
 
-        if tail and size > cap:
-            # tail needs a byte offset the SFTP helper does not expose, so this one case uses the
-            # login node — still metadata-class work on a bounded read.
-            res = self._login(f"tail -c {cap} {shlex.quote(p)}", timeout=60)
-            if getattr(res, "exit_status", 1) != 0:
-                raise HpcShellError(f"Could not read {p}: {_clip(res.stderr, 1000)}")
-            text, truncated = res.stdout, True
-        else:
-            try:
-                raw = self.remote.read_bytes(p, max_bytes=cap)
-            except Exception as exc:  # noqa: BLE001
-                raise HpcShellError(f"Could not read {p}: {exc}") from exc
-            if len(raw) < min(size, cap):
-                raise HpcShellError(f"Incomplete read of {p}; the file changed or the transfer failed. Retry the read.")
-            text = raw.decode("utf-8", errors="replace") if isinstance(raw, bytes) else str(raw)
-            truncated = size > cap
-        return {"path": p, "size_bytes": size, "truncated": truncated,
-                "bytes_returned": min(size, cap), "text": _clip(text, cap)}
+        start = max(0, size - cap) if tail else max(0, int(offset or 0))
+        if start >= size > 0:
+            return {"path": p, "size_bytes": size, "offset": start, "truncated": False,
+                    "bytes_returned": 0, "text": "", "note": f"offset {start} is at or past the end of the file."}
+        try:
+            # Bytes as stored, so ``next_offset`` counts the bytes the page holds.
+            raw = (self.remote.read_bytes(p, max_bytes=cap, offset=start) if start
+                   else self.remote.read_bytes(p, max_bytes=cap))
+        except Exception as exc:  # noqa: BLE001
+            raise HpcShellError(f"Could not read {p}: {exc}") from exc
+        raw = raw if isinstance(raw, bytes) else str(raw).encode("utf-8")
+        if len(raw) < min(size - start, cap):
+            raise HpcShellError(f"Incomplete read of {p}; the file changed or the transfer failed. Retry the read.")
+        page = _page(raw, MAX_PAGE_CHARS, from_end=tail)
+        if tail:
+            start += len(raw) - len(page)
+        end = start + len(page)
+        out = {"path": p, "size_bytes": size, "offset": start, "truncated": start > 0 if tail else end < size,
+               "bytes_returned": len(page), "text": page.decode("utf-8", errors="replace")}
+        if not tail and end < size:
+            out["next_offset"] = end
+            out["note"] = (f"Bytes {start}-{end} of {size}: the rest is not shown. Read on with "
+                           f"offset={end}.")
+        elif tail and start > 0:
+            out["note"] = f"The last {len(page)} of {size} bytes."
+        return out
 
     def disk_usage(self, path: str = "") -> dict[str, Any]:
         p = self._read_path(path or self.home or "~")
@@ -799,15 +846,19 @@ def hpc_shell_catalog(shell: HpcShell | None) -> list[HarnessTool]:
         ),
         HarnessTool(
             name="read_text",
-            description=("Read the head (or tail) of a text file on HPC3 — a VCF header, a log, a "
-                         "sample sheet, a README. Bounded in bytes; not for large matrices."),
+            description=("Read a text file on HPC3 one page at a time — a VCF header, a log, a "
+                         "sample sheet, a README, a result table a tool wrote. A page is whole lines, "
+                         "about 20,000 characters; when more follows, the result has `next_offset`: "
+                         "pass it as `offset` to read on. Not for large matrices."),
             parameters={"type": "object", "properties": {
                 "path": {"type": "string", "description": path_description},
-                "max_bytes": {"type": "integer", "description": f"Default and maximum {MAX_READ_BYTES}."},
+                "offset": {"type": "integer", "description": "Byte to start at (default 0): a result's `next_offset`."},
+                "max_bytes": {"type": "integer", "description": f"Bytes to read, default and maximum {MAX_READ_BYTES}; a page shows at most what fits."},
                 "tail": {"type": "boolean", "description": "Read the END of the file instead of the start."},
             }, "required": ["path"]},
             executor=_ok(lambda a, _c: shell.read_text(
-                _str(a, "path"), _int(a, "max_bytes", MAX_READ_BYTES), bool(a.get("tail")))),
+                _str(a, "path"), _int(a, "max_bytes", MAX_READ_BYTES), bool(a.get("tail")),
+                _int(a, "offset", 0))),
             reads_private_data=True,
             category="filesystem",
         ),

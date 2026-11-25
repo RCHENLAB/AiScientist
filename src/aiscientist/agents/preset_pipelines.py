@@ -283,8 +283,13 @@ def select_pipeline(
 
     # The router picks by description; a protocol whose defining tool cannot run in this deployment
     # must say so in its own line, or it reads as the best match right up until its first step.
+    # Every protocol names run_code for some steps; while the deployment runs no model-written code
+    # those steps are held one by one (research_lab/code_gate.py), so the code tools do not mark a
+    # whole protocol unavailable here, which would steer the router to "none" for every request.
+    from .code_policy import WITHHELD_TOOLS
+
     def _line(p: "PresetPipeline") -> str:
-        gaps = p.missing_tools(available_tools)
+        gaps = tuple(g for g in p.missing_tools(available_tools) if g not in WITHHELD_TOOLS)
         suffix = (f"  [NOT AVAILABLE in this deployment: {', '.join(gaps)}]" if gaps else "")
         return f"- {p.key}: {p.label}{suffix}"
 
